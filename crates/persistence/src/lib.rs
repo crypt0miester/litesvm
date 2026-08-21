@@ -35,7 +35,6 @@ fn extract_snapshot_v2(svm: &LiteSVM) -> LiteSvmSnapshotV2 {
         latest_blockhash: svm.latest_blockhash(),
         history: svm
             .transaction_history_entries()
-            .iter()
             .map(|(k, v)| (*k, TxResult::from_result(v.clone())))
             .collect(),
         history_capacity: svm.transaction_history_capacity() as u64,

@@ -312,8 +312,6 @@ much easier.
 use crate::register_tracing::DefaultRegisterTracingCallback;
 #[cfg(feature = "hashbrown")]
 use hashbrown::{hash_map::Entry, HashMap};
-#[cfg(feature = "persistence-internal")]
-use indexmap::IndexMap;
 #[cfg(feature = "precompiles")]
 use precompiles::load_precompiles;
 #[cfg(feature = "nodejs-internal")]
@@ -342,7 +340,7 @@ use {
             TRANSACTION_ACCOUNT_BASE_SIZE,
         },
     },
-    agave_feature_set::{raise_cpi_nesting_limit_to_8, FeatureSet},
+    agave_feature_set::FeatureSet,
     agave_reserved_account_keys::ReservedAccountKeys,
     log::error,
     solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
@@ -366,7 +364,9 @@ use {
     solana_nonce::{state::DurableNonce, NONCED_TX_MARKER_IX_INDEX},
     solana_program_runtime::{
         invoke_context::{BuiltinFunctionRegisterer, EnvironmentConfig, InvokeContext},
-        loaded_programs::{ProgramRuntimeEnvironment, ProgramRuntimeEnvironments},
+        loaded_programs::{
+            ProgramCacheForTxBatch, ProgramRuntimeEnvironment, ProgramRuntimeEnvironments,
+        },
         program_cache_entry::{ProgramCacheEntry, DELAY_VISIBILITY_SLOT_OFFSET},
         program_metrics::LoadProgramMetrics,
         solana_sbpf::program::BuiltinProgram,
@@ -449,6 +449,7 @@ pub struct LiteSVM {
     latest_blockhash: Hash,
     history: TransactionHistory,
     compute_budget: Option<ComputeBudget>,
+    base_compute_budget: ComputeBudget,
     sigverify: bool,
     blockhash_check: bool,
     fee_structure: FeeStructure,
@@ -484,6 +485,8 @@ impl Default for LiteSVM {
 impl LiteSVM {
     fn new_inner(_enable_register_tracing: bool) -> Self {
         let feature_set = FeatureSet::default();
+        let base_compute_budget =
+            ComputeBudget::new_with_defaults(feature_set.snapshot().raise_cpi_nesting_limit_to_8);
 
         #[allow(unused_mut)]
         let mut svm = Self {
@@ -494,6 +497,7 @@ impl LiteSVM {
             latest_blockhash: create_blockhash(b"genesis"),
             history: TransactionHistory::new(),
             compute_budget: None,
+            base_compute_budget,
             sigverify: false,
             blockhash_check: false,
             fee_structure: FeeStructure::default(),
@@ -680,6 +684,9 @@ impl LiteSVM {
     fn set_feature_set(&mut self, feature_set: FeatureSet) {
         self.feature_set = feature_set;
         self.reserved_account_keys = Self::reserved_account_keys_for_feature_set(&self.feature_set);
+        self.base_compute_budget = ComputeBudget::new_with_defaults(
+            self.feature_set.snapshot().raise_cpi_nesting_limit_to_8,
+        );
     }
 
     #[cfg_attr(feature = "nodejs-internal", qualifiers(pub))]
@@ -1192,17 +1199,13 @@ impl LiteSVM {
     fn create_transaction_context(
         &self,
         compute_budget: ComputeBudget,
+        rent: Rent,
         accounts: Vec<(Address, AccountSharedData)>,
         number_of_top_level_instructions: usize,
     ) -> TransactionContext<'_> {
         TransactionContext::new(
             accounts,
-            self.accounts
-                .sysvar_cache
-                .get_rent()
-                .unwrap()
-                .as_ref()
-                .clone(),
+            rent,
             compute_budget.max_instruction_stack_depth,
             compute_budget.max_instruction_trace_length,
             number_of_top_level_instructions,
@@ -1213,9 +1216,10 @@ impl LiteSVM {
         &self,
         tx: VersionedTransaction,
     ) -> Result<SanitizedTransaction, TransactionError> {
+        // Nothing in litesvm reads the message hash, so skip computing it
         let res = SanitizedTransaction::try_create(
             tx,
-            MessageHash::Compute,
+            MessageHash::Precomputed(Hash::default()),
             Some(false),
             &self.accounts,
             &self.reserved_account_keys.active,
@@ -1270,6 +1274,7 @@ impl LiteSVM {
         tx: &'b SanitizedTransaction,
         tx_config: TransactionConfiguration,
         log_collector: Rc<RefCell<LogCollector>>,
+        program_cache_for_tx_batch: &mut ProgramCacheForTxBatch,
     ) -> (
         Result<(), TransactionError>,
         u64,
@@ -1283,19 +1288,14 @@ impl LiteSVM {
         let compute_budget = self.compute_budget.unwrap_or_else(|| ComputeBudget {
             compute_unit_limit: u64::from(tx_config.compute_unit_limit),
             heap_size: tx_config.updated_heap_bytes,
-            ..ComputeBudget::new_with_defaults(
-                self.feature_set
-                    .is_active(&raise_cpi_nesting_limit_to_8::ID),
-            )
+            ..self.base_compute_budget
         });
-        let rent = self.accounts.sysvar_cache.get_rent().unwrap();
+        let rent = self.accounts.cached_rent();
         let relax_post_exec_min_balance_check = self
             .feature_set
             .is_active(&agave_feature_set::relax_post_exec_min_balance_check::ID);
         let message = tx.message();
         let blockhash = message.recent_blockhash();
-        //reload program cache
-        let mut program_cache_for_tx_batch = self.accounts.programs_cache.clone();
         let mut accumulated_consume_units = 0;
         let account_keys = message.account_keys();
         let prioritization_fee = tx_config.priority_fee_lamports;
@@ -1331,32 +1331,20 @@ impl LiteSVM {
                     (0, construct_instructions_account(message)?)
                 } else {
                     let is_instruction_account = message.is_instruction_account(i);
-                    let (loaded_size, mut account) = if !is_instruction_account
-                        && !message.is_writable(i)
-                        && self.accounts.programs_cache.find(key).is_some()
-                    {
-                        // Optimization to skip loading of accounts which are only used as
-                        // programs in top-level instructions and not passed as instruction accounts.
-                        let account = self.accounts.get_account(key).unwrap();
-                        (
-                            TRANSACTION_ACCOUNT_BASE_SIZE.saturating_add(account.data().len()),
-                            account,
-                        )
-                    } else {
-                        self.accounts
-                            .get_account(key)
-                            .map(|acc| {
-                                (
-                                    TRANSACTION_ACCOUNT_BASE_SIZE.saturating_add(acc.data().len()),
-                                    acc,
-                                )
-                            })
-                            .unwrap_or_else(|| {
-                                let mut default_account = AccountSharedData::default();
-                                default_account.set_rent_epoch(u64::MAX);
-                                (default_account.data().len(), default_account)
-                            })
-                    };
+                    let (loaded_size, mut account) = self
+                        .accounts
+                        .get_account(key)
+                        .map(|acc| {
+                            (
+                                TRANSACTION_ACCOUNT_BASE_SIZE.saturating_add(acc.data().len()),
+                                acc,
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            let mut default_account = AccountSharedData::default();
+                            default_account.set_rent_epoch(u64::MAX);
+                            (default_account.data().len(), default_account)
+                        });
                     if message.is_writable(i)
                         && account.rent_epoch() != u64::MAX
                         && rent.is_exempt(account.lamports(), account.data().len())
@@ -1456,13 +1444,14 @@ impl LiteSVM {
             Ok(program_indices) => {
                 let mut context = self.create_transaction_context(
                     compute_budget,
+                    rent.clone(),
                     accounts,
                     message.num_instructions(),
                 );
                 let feature_set = self.feature_set.runtime_features();
                 let mut invoke_context = InvokeContext::new(
                     &mut context,
-                    &mut program_cache_for_tx_batch,
+                    program_cache_for_tx_batch,
                     EnvironmentConfig::new(
                         *blockhash,
                         self.fee_structure.lamports_per_signature,
@@ -1544,6 +1533,24 @@ impl LiteSVM {
         sanitized_tx: &SanitizedTransaction,
         log_collector: Rc<RefCell<LogCollector>>,
     ) -> ExecutionResult {
+        // Lend the program cache instead of cloning it per transaction; draining keeps it unchanged
+        let mut program_cache = std::mem::take(&mut self.accounts.programs_cache);
+        let result = self.execute_sanitized_transaction_inner(
+            sanitized_tx,
+            log_collector,
+            &mut program_cache,
+        );
+        program_cache.drain_modified_entries();
+        self.accounts.programs_cache = program_cache;
+        result
+    }
+
+    fn execute_sanitized_transaction_inner(
+        &mut self,
+        sanitized_tx: &SanitizedTransaction,
+        log_collector: Rc<RefCell<LogCollector>>,
+        program_cache: &mut ProgramCacheForTxBatch,
+    ) -> ExecutionResult {
         let CheckAndProcessTransactionSuccess {
             core:
                 CheckAndProcessTransactionSuccessCore {
@@ -1553,7 +1560,7 @@ impl LiteSVM {
                 },
             fee,
             payer_key,
-        } = match self.check_and_process_transaction(sanitized_tx, log_collector) {
+        } = match self.check_and_process_transaction(sanitized_tx, log_collector, program_cache) {
             Ok(value) => value,
             Err(value) => return value,
         };
@@ -1592,9 +1599,16 @@ impl LiteSVM {
                 },
             fee,
             ..
-        } = match self.check_and_process_transaction(sanitized_tx, log_collector) {
-            Ok(value) => value,
-            Err(value) => return value,
+        } = {
+            let mut program_cache = self.accounts.programs_cache.clone();
+            match self.check_and_process_transaction(
+                sanitized_tx,
+                log_collector,
+                &mut program_cache,
+            ) {
+                Ok(value) => value,
+                Err(value) => return value,
+            }
         };
         if let Some(ctx) = context {
             execution_result_if_context(sanitized_tx, ctx, result, compute_units_consumed, fee)
@@ -1612,15 +1626,16 @@ impl LiteSVM {
         &'a self,
         sanitized_tx: &'b SanitizedTransaction,
         log_collector: Rc<RefCell<LogCollector>>,
+        program_cache: &mut ProgramCacheForTxBatch,
     ) -> Result<CheckAndProcessTransactionSuccess<'b>, ExecutionResult>
     where
         'a: 'b,
     {
         self.maybe_blockhash_check(sanitized_tx)?;
-        let tx_config = get_transaction_config(sanitized_tx, &self.feature_set)?;
         self.maybe_history_check(sanitized_tx)?;
+        let tx_config = get_transaction_config(sanitized_tx, &self.feature_set)?;
         let (result, compute_units_consumed, context, fee, payer_key) =
-            self.process_transaction(sanitized_tx, tx_config, log_collector);
+            self.process_transaction(sanitized_tx, tx_config, log_collector, program_cache);
         #[cfg(target_arch = "x86_64")]
         unsafe {
             core::arch::asm!("emms", options(nomem, nostack, preserves_flags));
@@ -1899,12 +1914,7 @@ impl LiteSVM {
         let debugging_features = self.enable_register_tracing;
         #[cfg(not(feature = "register-tracing"))]
         let debugging_features = false;
-        let compute_budget = self
-            .compute_budget
-            .unwrap_or(ComputeBudget::new_with_defaults(
-                self.feature_set
-                    .is_active(&raise_cpi_nesting_limit_to_8::ID),
-            ));
+        let compute_budget = self.compute_budget.unwrap_or(self.base_compute_budget);
         let env = create_program_runtime_environment(
             &self.feature_set.runtime_features(),
             &compute_budget.to_budget(),
@@ -1969,7 +1979,9 @@ impl LiteSVM {
     }
 
     #[cfg(feature = "persistence-internal")]
-    pub fn transaction_history_entries(&self) -> &IndexMap<Signature, TransactionResult> {
+    pub fn transaction_history_entries(
+        &self,
+    ) -> impl Iterator<Item = (&Signature, &TransactionResult)> {
         self.history.entries()
     }
 
@@ -2003,7 +2015,7 @@ impl LiteSVM {
     #[cfg(feature = "persistence-internal")]
     pub fn restore_transaction_history(
         &mut self,
-        entries: IndexMap<Signature, TransactionResult>,
+        entries: Vec<(Signature, TransactionResult)>,
         capacity: usize,
     ) {
         self.history = TransactionHistory::from_entries(entries, capacity);
@@ -2102,10 +2114,7 @@ fn get_transaction_config(
 
 /// Get the max number of accounts that a transaction may lock in this block
 fn get_transaction_account_lock_limit(svm: &LiteSVM) -> usize {
-    if svm
-        .feature_set
-        .is_active(&agave_feature_set::increase_tx_account_lock_limit::id())
-    {
+    if svm.feature_set.snapshot().increase_tx_account_lock_limit {
         MAX_TX_ACCOUNT_LOCKS
     } else {
         64

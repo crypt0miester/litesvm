@@ -1,5 +1,5 @@
 use {
-    criterion::{criterion_group, criterion_main, Criterion},
+    criterion::{criterion_group, criterion_main, BatchSize, Criterion},
     litesvm::LiteSVM,
     solana_account::Account,
     solana_address::Address,
@@ -8,7 +8,7 @@ use {
     solana_message::Message,
     solana_signer::Signer,
     solana_transaction::Transaction,
-    std::path::PathBuf,
+    std::{cell::RefCell, path::PathBuf},
 };
 
 const NUM_GREETINGS: u8 = 255;
@@ -55,18 +55,29 @@ fn criterion_benchmark(c: &mut Criterion) {
         &payer_kp,
         0,
     );
+    let svm = RefCell::new(svm);
     let mut group = c.benchmark_group("max_perf_comparison");
     group.bench_function("max_perf_litesvm", |b| {
-        b.iter(|| {
-            let _ = svm.set_account(counter_address, counter_acc(program_id));
-            for _ in 0..NUM_GREETINGS {
-                svm.send_transaction(tx.clone()).unwrap();
-            }
-            assert_eq!(
-                svm.get_account(&counter_address).unwrap().data[0],
-                NUM_GREETINGS
-            );
-        })
+        // Cloning is client work, keep it out of the measurement
+        b.iter_batched(
+            || {
+                let _ = svm
+                    .borrow_mut()
+                    .set_account(counter_address, counter_acc(program_id));
+                (0..NUM_GREETINGS).map(|_| tx.clone()).collect::<Vec<_>>()
+            },
+            |txs| {
+                let mut svm = svm.borrow_mut();
+                for tx in txs {
+                    svm.send_transaction(tx).unwrap();
+                }
+                assert_eq!(
+                    svm.get_account(&counter_address).unwrap().data[0],
+                    NUM_GREETINGS
+                );
+            },
+            BatchSize::PerIteration,
+        )
     });
 }
 

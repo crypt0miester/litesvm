@@ -74,6 +74,7 @@ pub struct AccountsDb {
     pub programs_cache: ProgramCacheForTxBatch,
     pub sysvar_cache: SysvarCache,
     pub environments: ProgramRuntimeEnvironments,
+    rent: Option<solana_rent::Rent>,
 }
 
 impl Clone for AccountsDb {
@@ -86,6 +87,7 @@ impl Clone for AccountsDb {
                 self.environments.get_env_for_execution().clone(),
                 self.environments.get_env_for_deployment().clone(),
             ),
+            rent: self.rent.clone(),
         }
     }
 }
@@ -101,6 +103,7 @@ impl Default for AccountsDb {
             programs_cache: ProgramCacheForTxBatch::new(0),
             sysvar_cache: SysvarCache::default(),
             environments: ProgramRuntimeEnvironments::new(env.clone(), env),
+            rent: None,
         }
     }
 }
@@ -108,6 +111,12 @@ impl Default for AccountsDb {
 impl AccountsDb {
     pub fn get_account_ref(&self, pubkey: &Address) -> Option<&AccountSharedData> {
         self.inner.get(pubkey)
+    }
+
+    pub(crate) fn cached_rent(&self) -> solana_rent::Rent {
+        self.rent
+            .clone()
+            .unwrap_or_else(|| self.sysvar_cache.get_rent().unwrap().as_ref().clone())
     }
 
     pub fn get_account(&self, pubkey: &Address) -> Option<AccountSharedData> {
@@ -149,47 +158,33 @@ impl AccountsDb {
         account: &AccountSharedData,
     ) -> Result<(), InvalidSysvarDataError> {
         use InvalidSysvarDataError::{
-            EpochRewards, EpochSchedule, Fees, LastRestartSlot, RecentBlockhashes, Rent,
-            SlotHashes, StakeHistory,
+            EpochRewards, EpochSchedule, Fees, RecentBlockhashes, SlotHashes, StakeHistory,
         };
-        let cache = &mut self.sysvar_cache;
+        if account.owner() != &solana_sdk_ids::sysvar::id() {
+            return Ok(());
+        }
+        // Fixed-width sysvars update in place; variable-width ones still reset and refill
         #[allow(deprecated)]
         match pubkey {
             CLOCK_ID => {
                 let parsed = Clock::deserialize_from(account.data())
                     .map_err(|_| InvalidSysvarDataError::Clock)?;
                 self.programs_cache.set_slot_for_tests(parsed.slot);
-                let accounts = &self.inner;
-                cache.reset();
-                cache.fill_missing_entries(|sysvar_pubkey, set_sysvar| {
-                    if *sysvar_pubkey == pubkey {
-                        set_sysvar(account.data())
-                    } else if let Some(acc) = accounts.get(sysvar_pubkey) {
-                        set_sysvar(acc.data())
-                    }
-                });
+                self.sysvar_cache.set_sysvar_for_tests(&parsed);
             }
             EPOCH_REWARDS_ID => {
-                handle_sysvar::<solana_epoch_rewards::EpochRewards>(
-                    cache,
-                    EpochRewards,
-                    account,
-                    &self.inner,
-                    pubkey,
-                )?;
+                let parsed = solana_epoch_rewards::EpochRewards::deserialize_from(account.data())
+                    .map_err(|_| EpochRewards)?;
+                self.sysvar_cache.set_sysvar_for_tests(&parsed);
             }
             EPOCH_SCHEDULE_ID => {
-                handle_sysvar::<solana_epoch_schedule::EpochSchedule>(
-                    cache,
-                    EpochSchedule,
-                    account,
-                    &self.inner,
-                    pubkey,
-                )?;
+                let parsed = solana_epoch_schedule::EpochSchedule::deserialize_from(account.data())
+                    .map_err(|_| EpochSchedule)?;
+                self.sysvar_cache.set_sysvar_for_tests(&parsed);
             }
             FEES_ID => {
                 handle_sysvar::<solana_sysvar::fees::Fees>(
-                    cache,
+                    &mut self.sysvar_cache,
                     Fees,
                     account,
                     &self.inner,
@@ -197,17 +192,15 @@ impl AccountsDb {
                 )?;
             }
             LAST_RESTART_SLOT_ID => {
-                handle_sysvar::<solana_sysvar::last_restart_slot::LastRestartSlot>(
-                    cache,
-                    LastRestartSlot,
-                    account,
-                    &self.inner,
-                    pubkey,
-                )?;
+                let parsed = solana_sysvar::last_restart_slot::LastRestartSlot::deserialize_from(
+                    account.data(),
+                )
+                .map_err(|_| InvalidSysvarDataError::LastRestartSlot)?;
+                self.sysvar_cache.set_sysvar_for_tests(&parsed);
             }
             RECENT_BLOCKHASHES_ID => {
                 handle_sysvar::<solana_sysvar::recent_blockhashes::RecentBlockhashes>(
-                    cache,
+                    &mut self.sysvar_cache,
                     RecentBlockhashes,
                     account,
                     &self.inner,
@@ -215,11 +208,14 @@ impl AccountsDb {
                 )?;
             }
             RENT_ID => {
-                handle_sysvar::<solana_rent::Rent>(cache, Rent, account, &self.inner, pubkey)?;
+                let parsed = solana_rent::Rent::deserialize_from(account.data())
+                    .map_err(|_| InvalidSysvarDataError::Rent)?;
+                self.sysvar_cache.set_sysvar_for_tests(&parsed);
+                self.rent = Some(parsed);
             }
             SLOT_HASHES_ID => {
                 handle_sysvar::<solana_slot_hashes::SlotHashes>(
-                    cache,
+                    &mut self.sysvar_cache,
                     SlotHashes,
                     account,
                     &self.inner,
@@ -228,7 +224,7 @@ impl AccountsDb {
             }
             STAKE_HISTORY_ID => {
                 handle_sysvar::<solana_stake_history::StakeHistory>(
-                    cache,
+                    &mut self.sysvar_cache,
                     StakeHistory,
                     account,
                     &self.inner,
@@ -259,6 +255,11 @@ impl AccountsDb {
         if let Ok(clock) = self.sysvar_cache.get_clock() {
             self.programs_cache.set_slot_for_tests(clock.slot);
         }
+        self.rent = self
+            .sysvar_cache
+            .get_rent()
+            .ok()
+            .map(|rent| rent.as_ref().clone());
     }
 
     /// Scans all accounts for executable BPF programs and loads them into the program cache.
