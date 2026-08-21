@@ -24,12 +24,10 @@ fn extract_snapshot_v2(svm: &LiteSVM) -> LiteSvmSnapshotV2 {
     LiteSvmSnapshotV2 {
         // AccountSharedData::clone is an Arc bump — no underlying data copy.
         // The actual data bytes are written once during serialization via AccountSchema.
-        accounts: svm
-            .accounts_db()
-            .inner
-            .iter()
-            .map(|(k, v)| AccountEntryWire::from((*k, v.clone())))
-            .collect(),
+        accounts: svm.accounts_db().scan_accounts(|iter| {
+            iter.map(|(k, v)| AccountEntryWire::from((*k, v.clone())))
+                .collect()
+        }),
         airdrop_kp: *svm.airdrop_keypair_bytes(),
         feature_set: FeatureSetSnapshot::from_feature_set(svm.get_feature_set_ref()),
         latest_blockhash: svm.latest_blockhash(),

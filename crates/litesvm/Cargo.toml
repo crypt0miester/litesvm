@@ -41,6 +41,7 @@ solana-syscalls.workspace = true
 ansi_term.workspace = true
 hashbrown = { workspace = true, optional = true }
 indexmap.workspace = true
+parking_lot.workspace = true
 itertools.workspace = true
 log.workspace = true
 qualifier_attr = { workspace = true, optional = true }

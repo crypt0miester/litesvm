@@ -30,6 +30,7 @@ napi = { version = "3.12.2", default-features = false }
 napi-build = "2.4.1"
 napi-derive = "3.6.3"
 nom = "8.0.0"
+parking_lot = "0.12"
 qualifier_attr = "0.2.2"
 serde = "1.0.229"
 sha2 = "0.10.9"

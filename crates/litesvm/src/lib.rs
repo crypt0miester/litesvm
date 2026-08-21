@@ -330,6 +330,7 @@ use {
         history::TransactionHistory,
         message_processor::process_message,
         programs::load_default_programs,
+        reader::SharedHash,
         types::{
             ExecutionResult, FailedTransactionMetadata, TransactionMetadata, TransactionResult,
         },
@@ -421,6 +422,8 @@ mod message_processor;
 #[cfg(feature = "precompiles")]
 mod precompiles;
 mod programs;
+mod reader;
+pub use reader::LiteSvmReader;
 #[cfg(feature = "register-tracing")]
 pub mod register_tracing;
 #[cfg(feature = "register-tracing")]
@@ -446,7 +449,7 @@ pub struct LiteSVM {
     airdrop_kp: [u8; 64],
     feature_set: FeatureSet,
     reserved_account_keys: ReservedAccountKeys,
-    latest_blockhash: Hash,
+    latest_blockhash: SharedHash,
     history: TransactionHistory,
     compute_budget: Option<ComputeBudget>,
     base_compute_budget: ComputeBudget,
@@ -494,7 +497,7 @@ impl LiteSVM {
             airdrop_kp: Keypair::new().to_bytes(),
             reserved_account_keys: Self::reserved_account_keys_for_feature_set(&feature_set),
             feature_set,
-            latest_blockhash: create_blockhash(b"genesis"),
+            latest_blockhash: SharedHash::new(create_blockhash(b"genesis")),
             history: TransactionHistory::new(),
             compute_budget: None,
             base_compute_budget,
@@ -602,7 +605,7 @@ impl LiteSVM {
         let fees = Fees::default();
         self.set_sysvar(&fees);
         self.set_sysvar(&LastRestartSlot::default());
-        let latest_blockhash = self.latest_blockhash;
+        let latest_blockhash = self.latest_blockhash.get();
         #[allow(deprecated)]
         self.set_sysvar(&RecentBlockhashes::from_iter([IterItem(
             0,
@@ -830,12 +833,11 @@ impl LiteSVM {
 
     /// Returns all accounts owned by the given program, together with their addresses.
     pub fn get_program_accounts(&self, program_id: &Address) -> Vec<(Address, Account)> {
-        self.accounts
-            .inner
-            .iter()
-            .filter(|(_, account)| account.owner() == program_id)
-            .map(|(address, account)| (*address, account.clone().into()))
-            .collect()
+        self.accounts.scan_accounts(|iter| {
+            iter.filter(|(_, account)| account.owner() == program_id)
+                .map(|(address, account)| (*address, account.clone().into()))
+                .collect()
+        })
     }
 
     /// Sets all information associated with the account of the provided pubkey.
@@ -958,12 +960,20 @@ impl LiteSVM {
 
     /// Gets the balance of the provided account pubkey.
     pub fn get_balance(&self, address: &Address) -> Option<u64> {
-        self.accounts.get_account_ref(address).map(|x| x.lamports())
+        self.accounts.get_account(address).map(|x| x.lamports())
     }
 
     /// Gets the latest blockhash.
     pub fn latest_blockhash(&self) -> Hash {
-        self.latest_blockhash
+        self.latest_blockhash.get()
+    }
+
+    /// A thread-safe read handle onto this SVM's accounts and latest blockhash
+    pub fn reader(&self) -> LiteSvmReader {
+        LiteSvmReader::new(
+            self.accounts.share_accounts(),
+            self.latest_blockhash.share(),
+        )
     }
 
     /// Sets the sysvar to the test environment.
@@ -986,7 +996,7 @@ impl LiteSVM {
     where
         T: Sysvar + SysvarId + DeserializeOwned<Dst = T>,
     {
-        T::deserialize_from(self.accounts.get_account_ref(&T::id()).unwrap().data()).unwrap()
+        T::deserialize_from(self.accounts.get_account(&T::id()).unwrap().data()).unwrap()
     }
 
     /// Gets a transaction from the transaction history.
@@ -1004,6 +1014,7 @@ impl LiteSVM {
     /// Airdrops the account with the lamports specified.
     pub fn airdrop(&mut self, address: &Address, lamports: u64) -> TransactionResult {
         let payer = Keypair::try_from(self.airdrop_kp.as_slice()).unwrap();
+        let latest_blockhash = self.latest_blockhash.get();
         let tx = VersionedTransaction::try_new(
             VersionedMessage::Legacy(Message::new_with_blockhash(
                 &[solana_system_interface::instruction::transfer(
@@ -1012,7 +1023,7 @@ impl LiteSVM {
                     lamports,
                 )],
                 Some(&payer.pubkey()),
-                &self.latest_blockhash,
+                &latest_blockhash,
             )),
             &[payer],
         )
@@ -1797,11 +1808,12 @@ impl LiteSVM {
 
     /// Expires the current blockhash.
     pub fn expire_blockhash(&mut self) {
-        self.latest_blockhash = create_blockhash(&self.latest_blockhash.to_bytes());
+        let new_blockhash = create_blockhash(&self.latest_blockhash.get().to_bytes());
+        self.latest_blockhash.set(new_blockhash);
         #[allow(deprecated)]
         self.set_sysvar(&RecentBlockhashes::from_iter([IterItem(
             0,
-            &self.latest_blockhash,
+            &new_blockhash,
             self.fee_structure.lamports_per_signature,
         )]));
     }
@@ -1841,18 +1853,17 @@ impl LiteSVM {
         tx: &SanitizedTransaction,
     ) -> solana_transaction_error::TransactionResult<()> {
         let recent_blockhash = tx.message().recent_blockhash();
-        if recent_blockhash == &self.latest_blockhash
-            || self.check_transaction_for_nonce(
-                tx,
-                &DurableNonce::from_blockhash(&self.latest_blockhash),
-            )
+        let latest_blockhash = self.latest_blockhash.get();
+        if recent_blockhash == &latest_blockhash
+            || self
+                .check_transaction_for_nonce(tx, &DurableNonce::from_blockhash(&latest_blockhash))
         {
             Ok(())
         } else {
             log::error!(
                 "Blockhash {} not found. Expected blockhash {}",
                 recent_blockhash,
-                self.latest_blockhash
+                latest_blockhash
             );
             Err(TransactionError::BlockhashNotFound)
         }
@@ -1861,10 +1872,10 @@ impl LiteSVM {
     fn check_message_for_nonce(&self, message: &SanitizedMessage) -> bool {
         message
             .get_durable_nonce()
-            .and_then(|nonce_address| self.accounts.get_account_ref(nonce_address))
+            .and_then(|nonce_address| self.accounts.get_account(nonce_address))
             .and_then(|nonce_account| {
                 solana_nonce_account::verify_nonce_account(
-                    nonce_account,
+                    &nonce_account,
                     message.recent_blockhash(),
                 )
             })
@@ -1999,7 +2010,7 @@ impl LiteSVM {
 
     #[cfg(feature = "persistence-internal")]
     pub fn set_latest_blockhash(&mut self, hash: Hash) {
-        self.latest_blockhash = hash;
+        self.latest_blockhash.set(hash);
     }
 
     #[cfg(feature = "persistence-internal")]

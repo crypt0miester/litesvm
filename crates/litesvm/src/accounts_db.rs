@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use {
     crate::error::{InvalidSysvarDataError, LiteSVMError},
     log::error,
+    parking_lot::RwLock,
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
     solana_address::Address,
     solana_address_lookup_table_interface::{error::AddressLookupError, state::AddressLookupTable},
@@ -43,6 +44,8 @@ use {
     wincode::DeserializeOwned,
 };
 
+pub(crate) type AccountsMap = HashMap<Address, AccountSharedData>;
+
 const FEES_ID: Address = Address::from_str_const("SysvarFees111111111111111111111111111111111");
 const RECENT_BLOCKHASHES_ID: Address =
     Address::from_str_const("SysvarRecentB1ockHashes11111111111111111111");
@@ -51,7 +54,7 @@ fn handle_sysvar<T>(
     cache: &mut SysvarCache,
     err_variant: InvalidSysvarDataError,
     account: &AccountSharedData,
-    accounts: &HashMap<Address, AccountSharedData>,
+    accounts: &AccountsMap,
     address: Address,
 ) -> Result<(), InvalidSysvarDataError>
 where
@@ -69,8 +72,9 @@ where
     Ok(())
 }
 
+/// Account map shared behind a lock; writers lock once and hand the guard to the _locked methods
 pub struct AccountsDb {
-    pub inner: HashMap<Address, AccountSharedData>,
+    accounts: Arc<RwLock<AccountsMap>>,
     pub programs_cache: ProgramCacheForTxBatch,
     pub sysvar_cache: SysvarCache,
     pub environments: ProgramRuntimeEnvironments,
@@ -80,7 +84,7 @@ pub struct AccountsDb {
 impl Clone for AccountsDb {
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.clone(),
+            accounts: Arc::new(RwLock::new(self.accounts.read().clone())),
             programs_cache: self.programs_cache.clone(),
             sysvar_cache: self.sysvar_cache.clone(),
             environments: ProgramRuntimeEnvironments::new(
@@ -99,7 +103,7 @@ impl Default for AccountsDb {
         );
 
         Self {
-            inner: HashMap::default(),
+            accounts: Arc::new(RwLock::new(AccountsMap::default())),
             programs_cache: ProgramCacheForTxBatch::new(0),
             sysvar_cache: SysvarCache::default(),
             environments: ProgramRuntimeEnvironments::new(env.clone(), env),
@@ -109,8 +113,26 @@ impl Default for AccountsDb {
 }
 
 impl AccountsDb {
-    pub fn get_account_ref(&self, pubkey: &Address) -> Option<&AccountSharedData> {
-        self.inner.get(pubkey)
+    pub fn get_account(&self, pubkey: &Address) -> Option<AccountSharedData> {
+        self.accounts.read().get(pubkey).cloned()
+    }
+
+    pub fn contains_account(&self, pubkey: &Address) -> bool {
+        self.accounts.read().contains_key(pubkey)
+    }
+
+    /// Runs f over every account under one read guard
+    pub fn scan_accounts<R>(
+        &self,
+        f: impl FnOnce(&mut dyn Iterator<Item = (&Address, &AccountSharedData)>) -> R,
+    ) -> R {
+        let map = self.accounts.read();
+        let mut iter = map.iter();
+        f(&mut iter)
+    }
+
+    pub(crate) fn share_accounts(&self) -> Arc<RwLock<AccountsMap>> {
+        Arc::clone(&self.accounts)
     }
 
     pub(crate) fn cached_rent(&self) -> solana_rent::Rent {
@@ -119,14 +141,10 @@ impl AccountsDb {
             .unwrap_or_else(|| self.sysvar_cache.get_rent().unwrap().as_ref().clone())
     }
 
-    pub fn get_account(&self, pubkey: &Address) -> Option<AccountSharedData> {
-        self.get_account_ref(pubkey).cloned()
-    }
-
     /// We should only use this when we know we're not touching any executable or sysvar accounts,
     /// or have already handled such cases.
     pub(crate) fn add_account_no_checks(&mut self, pubkey: Address, account: AccountSharedData) {
-        self.inner.insert(pubkey, account);
+        self.accounts.write().insert(pubkey, account);
     }
 
     pub(crate) fn add_account(
@@ -134,26 +152,38 @@ impl AccountsDb {
         pubkey: Address,
         account: AccountSharedData,
     ) -> Result<(), LiteSVMError> {
+        let accounts = Arc::clone(&self.accounts);
+        let mut map = accounts.write();
+        self.add_account_locked(&mut map, pubkey, account)
+    }
+
+    fn add_account_locked(
+        &mut self,
+        map: &mut AccountsMap,
+        pubkey: Address,
+        account: AccountSharedData,
+    ) -> Result<(), LiteSVMError> {
         if account.executable()
             && pubkey != Address::default()
             && account.owner() != &native_loader::ID
         {
-            let loaded_program = self.load_program(&account)?;
+            let loaded_program = self.load_program(map, &account)?;
             self.programs_cache
                 .replenish(pubkey, Arc::new(loaded_program));
         } else {
-            self.maybe_handle_sysvar_account(pubkey, &account)?;
+            self.maybe_handle_sysvar_account(map, pubkey, &account)?;
         }
         if account.lamports() == 0 {
-            self.inner.remove(&pubkey);
+            map.remove(&pubkey);
         } else {
-            self.add_account_no_checks(pubkey, account);
+            map.insert(pubkey, account);
         }
         Ok(())
     }
 
     fn maybe_handle_sysvar_account(
         &mut self,
+        map: &AccountsMap,
         pubkey: Address,
         account: &AccountSharedData,
     ) -> Result<(), InvalidSysvarDataError> {
@@ -187,7 +217,7 @@ impl AccountsDb {
                     &mut self.sysvar_cache,
                     Fees,
                     account,
-                    &self.inner,
+                    map,
                     pubkey,
                 )?;
             }
@@ -203,7 +233,7 @@ impl AccountsDb {
                     &mut self.sysvar_cache,
                     RecentBlockhashes,
                     account,
-                    &self.inner,
+                    map,
                     pubkey,
                 )?;
             }
@@ -218,7 +248,7 @@ impl AccountsDb {
                     &mut self.sysvar_cache,
                     SlotHashes,
                     account,
-                    &self.inner,
+                    map,
                     pubkey,
                 )?;
             }
@@ -227,7 +257,7 @@ impl AccountsDb {
                     &mut self.sysvar_cache,
                     StakeHistory,
                     account,
-                    &self.inner,
+                    map,
                     pubkey,
                 )?;
             }
@@ -238,17 +268,18 @@ impl AccountsDb {
 
     /// Skip the executable() checks for builtin accounts
     pub(crate) fn add_builtin_account(&mut self, address: Address, data: AccountSharedData) {
-        self.inner.insert(address, data);
+        self.accounts.write().insert(address, data);
     }
 
-    /// Rebuilds the sysvar cache from account data already present in `self.inner`.
+    /// Rebuilds the sysvar cache from account data already in the map
     #[cfg(feature = "persistence-internal")]
     pub(crate) fn rebuild_sysvar_cache(&mut self) {
+        let accounts = Arc::clone(&self.accounts);
+        let map = accounts.read();
         self.sysvar_cache.reset();
-        let accounts = &self.inner;
         self.sysvar_cache
             .fill_missing_entries(|pubkey, set_sysvar| {
-                if let Some(acc) = accounts.get(pubkey) {
+                if let Some(acc) = map.get(pubkey) {
                     set_sysvar(acc.data())
                 }
             });
@@ -265,20 +296,22 @@ impl AccountsDb {
     /// Scans all accounts for executable BPF programs and loads them into the program cache.
     #[cfg(feature = "persistence-internal")]
     pub(crate) fn load_all_existing_programs(&mut self) -> Result<(), LiteSVMError> {
-        let executable_keys = self
-            .inner
+        let accounts = Arc::clone(&self.accounts);
+        let map = accounts.read();
+        let executable_accounts: Vec<(Address, AccountSharedData)> = map
             .iter()
             .filter(|(_, acc)| acc.executable() && acc.owner() != &native_loader::ID)
-            .map(|(k, _)| *k);
+            .map(|(k, acc)| (*k, acc.clone()))
+            .collect();
 
-        for key in executable_keys {
-            let account = self.inner.get(&key).unwrap().clone();
-            let loaded = self.load_program(&account)?;
+        for (key, account) in executable_accounts {
+            let loaded = self.load_program(&map, &account)?;
             self.programs_cache.replenish(key, Arc::new(loaded));
         }
         Ok(())
     }
 
+    /// Applies a transaction's post accounts under one write guard
     pub(crate) fn sync_accounts(
         &mut self,
         mut accounts: Vec<(Address, AccountSharedData)>,
@@ -288,14 +321,17 @@ impl AccountsDb {
             x.1.owner() == &bpf_loader_upgradeable::id()
                 && x.1.data().first().is_some_and(|byte| *byte == 3)
         });
+        let shared = Arc::clone(&self.accounts);
+        let mut map = shared.write();
         for (address, acc) in accounts {
-            self.add_account(address, acc)?;
+            self.add_account_locked(&mut map, address, acc)?;
         }
         Ok(())
     }
 
     fn load_program(
         &self,
+        map: &AccountsMap,
         program_account: &AccountSharedData,
     ) -> Result<ProgramCacheEntry, InstructionError> {
         let metrics = &mut LoadProgramMetrics::default();
@@ -328,7 +364,7 @@ impl AccountsDb {
                 );
                 return Err(InstructionError::InvalidAccountData);
             };
-            let Some(programdata_account) = self.get_account_ref(&programdata_address) else {
+            let Some(programdata_account) = map.get(&programdata_address) else {
                 return Ok(ProgramCacheEntry::new_tombstone(
                     slot,
                     ProgramCacheEntryOwner::LoaderV3,
@@ -389,8 +425,9 @@ impl AccountsDb {
         &self,
         address_table_lookup: &MessageAddressTableLookup,
     ) -> std::result::Result<LoadedAddresses, AddressLookupError> {
-        let table_account = self
-            .get_account_ref(&address_table_lookup.account_key)
+        let map = self.accounts.read();
+        let table_account = map
+            .get(&address_table_lookup.account_key)
             .ok_or(AddressLookupError::LookupTableAccountNotFound)?;
 
         if table_account.owner() == &solana_sdk_ids::address_lookup_table::id() {
@@ -421,7 +458,9 @@ impl AccountsDb {
         address: &Address,
         lamports: u64,
     ) -> solana_transaction_error::TransactionResult<()> {
-        match self.inner.get_mut(address) {
+        let accounts = Arc::clone(&self.accounts);
+        let mut map = accounts.write();
+        match map.get_mut(address) {
             Some(account) => {
                 let min_balance = match get_system_account_kind(account) {
                     Some(SystemAccountKind::Nonce) => self
@@ -449,19 +488,20 @@ impl AccountsDb {
         }
     }
 
-    /// Returns a borrowed slice of ELF bytes for this account.
+    /// Returns a copy of the ELF bytes for this account
     /// Fails if the account is not a program account.
-    pub fn try_program_elf_bytes<'a>(
-        &'a self,
+    pub fn try_program_elf_bytes(
+        &self,
         program_key: &Address,
-    ) -> std::result::Result<&'a [u8], InstructionError> {
-        let program_account = self
-            .get_account_ref(program_key)
+    ) -> std::result::Result<Vec<u8>, InstructionError> {
+        let map = self.accounts.read();
+        let program_account = map
+            .get(program_key)
             .ok_or(InstructionError::MissingAccount)?;
         let owner = program_account.owner();
 
         if bpf_loader::check_id(owner) || bpf_loader_deprecated::check_id(owner) {
-            Ok(program_account.data())
+            Ok(program_account.data().to_vec())
         } else if bpf_loader_upgradeable::check_id(owner) {
             let Ok(UpgradeableLoaderState::Program {
                 programdata_address,
@@ -469,16 +509,15 @@ impl AccountsDb {
             else {
                 return Err(InstructionError::InvalidAccountData);
             };
-            let programdata_account =
-                self.get_account_ref(&programdata_address).ok_or_else(|| {
-                    error!("Program data account {programdata_address} not found");
-                    InstructionError::MissingAccount
-                })?;
+            let programdata_account = map.get(&programdata_address).ok_or_else(|| {
+                error!("Program data account {programdata_address} not found");
+                InstructionError::MissingAccount
+            })?;
             let program_data = programdata_account.data();
             if let Some(programdata) =
                 program_data.get(UpgradeableLoaderState::size_of_programdata_metadata()..)
             {
-                Ok(programdata)
+                Ok(programdata.to_vec())
             } else {
                 error!("Index out of bounds using bpf_loader_upgradeable.");
                 Err(InstructionError::InvalidAccountData)
@@ -488,7 +527,7 @@ impl AccountsDb {
                 .data()
                 .get(LoaderV4State::program_data_offset()..)
             {
-                Ok(elf_bytes)
+                Ok(elf_bytes.to_vec())
             } else {
                 error!("Index out of bounds using loader_v4.");
                 Err(InstructionError::InvalidAccountData)

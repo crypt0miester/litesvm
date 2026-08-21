@@ -1897,6 +1897,7 @@ dependencies = [
  "libsecp256k1",
  "log",
  "nom",
+ "parking_lot",
  "qualifier_attr",
  "serde",
  "sha2 0.10.9",
