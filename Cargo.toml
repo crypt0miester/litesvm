@@ -35,7 +35,7 @@ serde = "1.0.229"
 sha2 = "0.10.9"
 smallvec = "1.15"
 solana-account = "4.3.0"
-solana-address = "~2.6.1"
+solana-address = "2.6"
 solana-address-lookup-table-interface = "~3.1.0"
 solana-builtins = "4.2.1"
 solana-clock = "~3.1.1"
@@ -49,9 +49,9 @@ solana-fee = "4.2.1"
 solana-feature-gate-interface = "4.0.0"
 solana-fee-calculator = "~3.2.2"
 solana-fee-structure = "3.0.0"
-solana-hash = "~4.5.0"
+solana-hash = "4.5"
 solana-instruction = "~3.4.0"
-solana-instruction-error = "~2.4.0"
+solana-instruction-error = "2.4"
 solana-instructions-sysvar = "4.0.0"
 solana-keypair = "3.1.2"
 solana-last-restart-slot = "~3.1.0"
@@ -72,7 +72,7 @@ solana-sdk-ids = "3.1.0"
 solana-secp256k1-program = "3.0.1"
 solana-sha256-hasher = "3.1.0"
 solana-short-vec = "~3.2.2"
-solana-signature = "~3.4.1"
+solana-signature = "3.4"
 solana-signer = "3.0.1"
 solana-slot-hashes = "~3.1.0"
 solana-slot-history = "~3.1.0"
@@ -114,3 +114,22 @@ codegen-units = 1
 
 [workspace.lints.clippy]
 result_large_err = "allow"
+
+[patch.crates-io]
+solana-address = { git = "https://github.com/spool-labs/solana-sdk", branch = "master" }
+solana-atomic-u64 = { git = "https://github.com/spool-labs/solana-sdk", branch = "master" }
+solana-define-syscall = { git = "https://github.com/spool-labs/solana-sdk", branch = "master" }
+solana-derivation-path = { git = "https://github.com/spool-labs/solana-sdk", branch = "master" }
+solana-hash = { git = "https://github.com/spool-labs/solana-sdk", branch = "master" }
+solana-instruction-error = { git = "https://github.com/spool-labs/solana-sdk", branch = "master" }
+solana-keypair = { git = "https://github.com/spool-labs/solana-sdk", branch = "master" }
+solana-nullable = { git = "https://github.com/spool-labs/solana-sdk", branch = "master" }
+solana-program-error = { git = "https://github.com/spool-labs/solana-sdk", branch = "master" }
+solana-pubkey = { git = "https://github.com/spool-labs/solana-sdk", branch = "master" }
+solana-sanitize = { git = "https://github.com/spool-labs/solana-sdk", branch = "master" }
+solana-seed-derivable = { git = "https://github.com/spool-labs/solana-sdk", branch = "master" }
+solana-seed-phrase = { git = "https://github.com/spool-labs/solana-sdk", branch = "master" }
+solana-sha256-hasher = { git = "https://github.com/spool-labs/solana-sdk", branch = "master" }
+solana-signature = { git = "https://github.com/spool-labs/solana-sdk", branch = "master" }
+solana-signer = { git = "https://github.com/spool-labs/solana-sdk", branch = "master" }
+solana-transaction-error = { git = "https://github.com/spool-labs/solana-sdk", branch = "master" }
