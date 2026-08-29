@@ -1760,10 +1760,26 @@ impl LiteSVM {
         }
     }
 
-    /// Simulates a transaction.
+    /// Simulates a transaction, verifying signatures if sigverify is enabled
     pub fn simulate_transaction(
         &self,
         tx: impl Into<VersionedTransaction>,
+    ) -> Result<SimulatedTransactionInfo, FailedTransactionMetadata> {
+        self.simulate_transaction_inner(tx, self.sigverify)
+    }
+
+    /// Simulates without verifying signatures, the sigVerify default of simulateTransaction
+    pub fn simulate_transaction_no_verify(
+        &self,
+        tx: impl Into<VersionedTransaction>,
+    ) -> Result<SimulatedTransactionInfo, FailedTransactionMetadata> {
+        self.simulate_transaction_inner(tx, false)
+    }
+
+    fn simulate_transaction_inner(
+        &self,
+        tx: impl Into<VersionedTransaction>,
+        verify: bool,
     ) -> Result<SimulatedTransactionInfo, FailedTransactionMetadata> {
         let log_collector = LogCollector {
             bytes_limit: self.log_bytes_limit,
@@ -1779,7 +1795,7 @@ impl LiteSVM {
             return_data,
             fee,
             ..
-        } = if self.sigverify {
+        } = if verify {
             self.execute_transaction_readonly(tx.into(), log_collector.clone())
         } else {
             self.execute_transaction_no_verify_readonly(tx.into(), log_collector.clone())

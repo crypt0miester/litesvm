@@ -103,6 +103,13 @@ wincode-derive = "0.4.6"
 [profile.bench]
 debug = true
 
+# unoptimised solana-ed25519 dominates every test that sends a transaction
+[profile.dev.package.solana-ed25519]
+opt-level = 3
+
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
