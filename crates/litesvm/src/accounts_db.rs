@@ -135,6 +135,40 @@ impl AccountsDb {
         Arc::clone(&self.accounts)
     }
 
+    /// Clone out keys and their owners under one read guard
+    pub(crate) fn copy_working_set<'a>(
+        &self,
+        keys: impl Iterator<Item = &'a Address>,
+    ) -> AccountsMap {
+        let map = self.accounts.read();
+        let mut working = AccountsMap::default();
+        for key in keys {
+            let Some(account) = map.get(key) else {
+                continue;
+            };
+            let owner = *account.owner();
+            working.insert(*key, account.clone());
+            if let Some(owner_account) = map.get(&owner) {
+                working.insert(owner, owner_account.clone());
+            }
+        }
+        working
+    }
+
+    /// A db over working alone, the map an off-lock execution reads
+    pub(crate) fn with_working_set(&self, working: AccountsMap) -> Self {
+        Self {
+            accounts: Arc::new(RwLock::new(working)),
+            programs_cache: self.programs_cache.clone(),
+            sysvar_cache: self.sysvar_cache.clone(),
+            environments: ProgramRuntimeEnvironments::new(
+                self.environments.get_env_for_execution().clone(),
+                self.environments.get_env_for_deployment().clone(),
+            ),
+            rent: self.rent.clone(),
+        }
+    }
+
     pub(crate) fn cached_rent(&self) -> solana_rent::Rent {
         self.rent
             .clone()

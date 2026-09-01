@@ -55,6 +55,15 @@ impl TransactionHistory {
         self.map.contains_key(signature)
     }
 
+    /// A history holding only what a replay check on signature reads
+    pub(crate) fn only(&self, signature: &Signature) -> Self {
+        let mut kept = TransactionHistory::new();
+        if let Some(result) = self.map.get(signature) {
+            kept.add_new_transaction(*signature, result.clone());
+        }
+        kept
+    }
+
     #[cfg(feature = "persistence-internal")]
     pub fn entries(&self) -> impl Iterator<Item = (&Signature, &TransactionResult)> {
         self.order

@@ -424,6 +424,8 @@ mod precompiles;
 mod programs;
 mod reader;
 pub use reader::LiteSvmReader;
+mod simulation;
+pub use simulation::PreparedSimulation;
 #[cfg(feature = "register-tracing")]
 pub mod register_tracing;
 #[cfg(feature = "register-tracing")]
@@ -1709,11 +1711,7 @@ impl LiteSVM {
 
     /// Submits a signed transaction.
     pub fn send_transaction(&mut self, tx: impl Into<VersionedTransaction>) -> TransactionResult {
-        let log_collector = LogCollector {
-            bytes_limit: self.log_bytes_limit,
-            ..Default::default()
-        };
-        let log_collector = Rc::new(RefCell::new(log_collector));
+        let log_collector = new_log_collector(self.log_bytes_limit);
         let vtx: VersionedTransaction = tx.into();
         let ExecutionResult {
             post_accounts,
@@ -1781,44 +1779,48 @@ impl LiteSVM {
         tx: impl Into<VersionedTransaction>,
         verify: bool,
     ) -> Result<SimulatedTransactionInfo, FailedTransactionMetadata> {
-        let log_collector = LogCollector {
-            bytes_limit: self.log_bytes_limit,
-            ..Default::default()
-        };
-        let log_collector = Rc::new(RefCell::new(log_collector));
-        let ExecutionResult {
-            post_accounts,
-            tx_result,
-            signature,
-            compute_units_consumed,
-            inner_instructions,
-            return_data,
-            fee,
-            ..
-        } = if verify {
+        let log_collector = new_log_collector(self.log_bytes_limit);
+        let result = if verify {
             self.execute_transaction_readonly(tx.into(), log_collector.clone())
         } else {
             self.execute_transaction_no_verify_readonly(tx.into(), log_collector.clone())
         };
-        let Ok(logs) = Rc::try_unwrap(log_collector).map(|lc| lc.into_inner().messages) else {
-            unreachable!("Log collector should not be used after simulate_transaction returns")
-        };
-        let meta = TransactionMetadata {
-            signature,
-            logs,
-            inner_instructions,
-            compute_units_consumed,
-            return_data,
-            fee,
-        };
+        simulation_outcome(result, log_collector)
+    }
 
-        if let Err(tx_err) = tx_result {
-            Err(FailedTransactionMetadata { err: tx_err, meta })
-        } else {
-            Ok(SimulatedTransactionInfo {
-                meta,
-                post_accounts,
-            })
+    /// Copies what tx reads under one guard into a simulation that runs off this instance
+    pub fn prepare_simulation(&self, tx: impl Into<VersionedTransaction>) -> PreparedSimulation {
+        let prepared = self
+            .sanitize_transaction_no_verify(tx.into())
+            .map(|sanitized| (self.simulation_view(&sanitized), sanitized));
+        PreparedSimulation::new(prepared, self.log_bytes_limit)
+    }
+
+    /// This instance narrowed to the accounts tx reads, with its own copy of everything else
+    fn simulation_view(&self, tx: &SanitizedTransaction) -> Self {
+        let working = self
+            .accounts
+            .copy_working_set(tx.message().account_keys().iter());
+        Self {
+            accounts: self.accounts.with_working_set(working),
+            airdrop_kp: self.airdrop_kp,
+            feature_set: self.feature_set.clone(),
+            reserved_account_keys: self.reserved_account_keys.clone(),
+            latest_blockhash: self.latest_blockhash.clone(),
+            history: self.history.only(tx.signature()),
+            compute_budget: self.compute_budget,
+            base_compute_budget: self.base_compute_budget,
+            sigverify: self.sigverify,
+            blockhash_check: self.blockhash_check,
+            fee_structure: self.fee_structure.clone(),
+            log_bytes_limit: self.log_bytes_limit,
+            custom_syscalls: self.custom_syscalls.clone(),
+            epoch_total_stake: self.epoch_total_stake,
+            epoch_vote_stakes: self.epoch_vote_stakes.clone(),
+            #[cfg(feature = "invocation-inspect-callback")]
+            invocation_inspect_callback: Arc::clone(&self.invocation_inspect_callback),
+            #[cfg(feature = "invocation-inspect-callback")]
+            enable_register_tracing: self.enable_register_tracing,
         }
     }
 
@@ -2250,6 +2252,48 @@ fn validate_fee_payer(
         payer_address,
         payer_index,
     )
+}
+
+fn new_log_collector(bytes_limit: Option<usize>) -> Rc<RefCell<LogCollector>> {
+    Rc::new(RefCell::new(LogCollector {
+        bytes_limit,
+        ..Default::default()
+    }))
+}
+
+fn simulation_outcome(
+    result: ExecutionResult,
+    log_collector: Rc<RefCell<LogCollector>>,
+) -> Result<SimulatedTransactionInfo, FailedTransactionMetadata> {
+    let ExecutionResult {
+        post_accounts,
+        tx_result,
+        signature,
+        compute_units_consumed,
+        inner_instructions,
+        return_data,
+        fee,
+        ..
+    } = result;
+    let Ok(logs) = Rc::try_unwrap(log_collector).map(|lc| lc.into_inner().messages) else {
+        unreachable!("Log collector should not be used after simulate_transaction returns")
+    };
+    let meta = TransactionMetadata {
+        signature,
+        logs,
+        inner_instructions,
+        compute_units_consumed,
+        return_data,
+        fee,
+    };
+
+    match tx_result {
+        Err(tx_err) => Err(FailedTransactionMetadata { err: tx_err, meta }),
+        Ok(()) => Ok(SimulatedTransactionInfo {
+            meta,
+            post_accounts,
+        }),
+    }
 }
 
 fn map_sanitize_result<F>(
