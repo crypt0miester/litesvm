@@ -1,5 +1,5 @@
 use {
-    criterion::{criterion_group, criterion_main, Criterion},
+    criterion::{criterion_group, criterion_main, BatchSize, Criterion},
     litesvm::LiteSVM,
     solana_account::Account,
     solana_address::Address,
@@ -8,7 +8,7 @@ use {
     solana_message::Message,
     solana_signer::Signer,
     solana_transaction::Transaction,
-    std::path::PathBuf,
+    std::{cell::RefCell, path::PathBuf},
 };
 
 fn read_counter_program() -> Vec<u8> {
@@ -49,27 +49,40 @@ fn criterion_benchmark(c: &mut Criterion) {
         .unwrap();
     svm.airdrop(&payer_pk, 100_000_000_000_000).unwrap();
     let counter_address = Address::new_unique();
+    let svm = RefCell::new(svm);
     c.bench_function("simple_bench", |b| {
-        b.iter(|| {
-            let _ = svm.set_account(counter_address, counter_acc(program_id));
-            svm.expire_blockhash();
-            let latest_blockhash = svm.latest_blockhash();
-            for deduper in 0..NUM_GREETINGS {
-                let tx = make_tx(
-                    program_id,
-                    counter_address,
-                    &payer_pk,
-                    latest_blockhash,
-                    &payer_kp,
-                    deduper,
+        // Client work stays out of the measurement; a fresh blockhash keeps signatures unique
+        b.iter_batched(
+            || {
+                let mut svm = svm.borrow_mut();
+                let _ = svm.set_account(counter_address, counter_acc(program_id));
+                svm.expire_blockhash();
+                let latest_blockhash = svm.latest_blockhash();
+                (0..NUM_GREETINGS)
+                    .map(|deduper| {
+                        make_tx(
+                            program_id,
+                            counter_address,
+                            &payer_pk,
+                            latest_blockhash,
+                            &payer_kp,
+                            deduper,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+            |txs| {
+                let mut svm = svm.borrow_mut();
+                for tx in txs {
+                    svm.send_transaction(tx).unwrap();
+                }
+                assert_eq!(
+                    svm.get_account(&counter_address).unwrap().data[0],
+                    NUM_GREETINGS
                 );
-                svm.send_transaction(tx).unwrap();
-            }
-            assert_eq!(
-                svm.get_account(&counter_address).unwrap().data[0],
-                NUM_GREETINGS
-            );
-        })
+            },
+            BatchSize::PerIteration,
+        )
     });
 }
 

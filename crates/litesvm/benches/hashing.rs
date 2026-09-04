@@ -1,14 +1,12 @@
 use {
     criterion::{criterion_group, criterion_main, Criterion},
     solana_address::Address,
-    std::{
-        hash::{BuildHasher, BuildHasherDefault, DefaultHasher},
-        hint::black_box,
-    },
+    std::{collections::hash_map::RandomState, hash::BuildHasher, hint::black_box},
 };
 
+// RandomState is the std HashMap hasher, so this is what the accounts map pays without hashbrown
 #[inline(never)]
-fn std_default(address: &Address, hash_builder: &BuildHasherDefault<DefaultHasher>) -> u64 {
+fn std_default(address: &Address, hash_builder: &RandomState) -> u64 {
     hash_builder.hash_one(address)
 }
 
@@ -24,7 +22,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("hashers");
 
     group.bench_function("default", |b| {
-        let hash_builder = BuildHasherDefault::<DefaultHasher>::default();
+        let hash_builder = RandomState::new();
 
         b.iter(|| {
             black_box(std_default(&address, &hash_builder));

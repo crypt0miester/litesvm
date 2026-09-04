@@ -186,7 +186,7 @@ impl DefaultRegisterTracingCallback {
         if let Ok(elf_data) = svm.accounts_db().try_program_elf_bytes(program_id) {
             // Persist the preload hash of the executable.
             let mut so_hash_file = File::create(base_fname.with_extension("exec.sha256"))?;
-            let _ = so_hash_file.write(compute_hash(elf_data).as_bytes());
+            let _ = so_hash_file.write(compute_hash(&elf_data).as_bytes());
         }
 
         // Get the relocated executable.
@@ -237,8 +237,9 @@ impl DefaultRegisterTracingCallback {
 
         maybe_elf_program_ids.iter().for_each(|maybe_program_id| {
             if let Ok(elf_data) = svm.accounts_db().try_program_elf_bytes(maybe_program_id) {
-                let _ = program_ids_file
-                    .write(format!("{}={}\n", maybe_program_id, compute_hash(elf_data)).as_bytes());
+                let _ = program_ids_file.write(
+                    format!("{}={}\n", maybe_program_id, compute_hash(&elf_data)).as_bytes(),
+                );
             }
         });
 

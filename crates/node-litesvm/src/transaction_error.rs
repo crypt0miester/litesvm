@@ -258,6 +258,7 @@ fn convert_instruction_error(e: InstructionErrorOriginal) -> InstructionError {
         InstructionErrorOriginal::BuiltinProgramsMustConsumeComputeUnits => {
             InstructionError::A(InstructionErrorFieldless::BuiltinProgramsMustConsumeComputeUnits)
         }
+        _ => InstructionError::A(InstructionErrorFieldless::GenericError),
     }
 }
 
@@ -493,6 +494,9 @@ pub(crate) fn convert_transaction_error(w: TransactionErrorOriginal) -> Transact
         }
         TransactionErrorOriginal::CommitCancelled => {
             TransactionError::A(TransactionErrorFieldless::CommitCancelled)
+        }
+        _ => {
+            unreachable!("every TransactionError variant in the pinned solana-sdk is matched above")
         }
     }
 }

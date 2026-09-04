@@ -441,8 +441,7 @@ impl LiteSvm {
         if self
             .0
             .accounts_db()
-            .inner
-            .contains_key(&native_mint::inline_spl::SPL_TOKEN_PROGRAM_ID)
+            .contains_account(&native_mint::inline_spl::SPL_TOKEN_PROGRAM_ID)
         {
             native_mint::create_native_mint(&mut self.0);
         }
@@ -450,8 +449,7 @@ impl LiteSvm {
         if self
             .0
             .accounts_db()
-            .inner
-            .contains_key(&native_mint::inline_spl::SPL_TOKEN_2022_PROGRAM_ID)
+            .contains_account(&native_mint::inline_spl::SPL_TOKEN_2022_PROGRAM_ID)
         {
             native_mint::create_native_mint_2022(&mut self.0);
         }

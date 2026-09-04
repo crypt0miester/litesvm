@@ -97,13 +97,13 @@ pub fn test_cpi_with_debugger() {
             "{}={}\n{}={}\n",
             cpi_maker_program_id,
             compute_hash(
-                svm.accounts_db()
+                &svm.accounts_db()
                     .try_program_elf_bytes(&cpi_maker_program_id)
                     .unwrap()
             ),
             cpi_target_program_id,
             compute_hash(
-                svm.accounts_db()
+                &svm.accounts_db()
                     .try_program_elf_bytes(&cpi_target_program_id)
                     .unwrap()
             ),
