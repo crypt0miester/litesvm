@@ -1788,11 +1788,30 @@ impl LiteSVM {
         simulation_outcome(result, log_collector)
     }
 
-    /// Copies what tx reads under one guard into a simulation that runs off this instance
+    /// Like simulate_transaction, but copies what tx reads under one guard into a run off this instance
     pub fn prepare_simulation(&self, tx: impl Into<VersionedTransaction>) -> PreparedSimulation {
-        let prepared = self
-            .sanitize_transaction_no_verify(tx.into())
-            .map(|sanitized| (self.simulation_view(&sanitized), sanitized));
+        self.prepare_simulation_inner(tx.into(), self.sigverify)
+    }
+
+    /// Prepares without verifying signatures, the sigVerify default of simulateTransaction
+    pub fn prepare_simulation_no_verify(
+        &self,
+        tx: impl Into<VersionedTransaction>,
+    ) -> PreparedSimulation {
+        self.prepare_simulation_inner(tx.into(), false)
+    }
+
+    fn prepare_simulation_inner(
+        &self,
+        tx: VersionedTransaction,
+        verify: bool,
+    ) -> PreparedSimulation {
+        let sanitized = if verify {
+            self.sanitize_transaction(tx)
+        } else {
+            self.sanitize_transaction_no_verify(tx)
+        };
+        let prepared = sanitized.map(|sanitized| (self.simulation_view(&sanitized), sanitized));
         PreparedSimulation::new(prepared, self.log_bytes_limit)
     }
 
