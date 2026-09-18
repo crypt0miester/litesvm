@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use {
     crate::error::{InvalidSysvarDataError, LiteSVMError},
     log::error,
-    parking_lot::RwLock,
+    parking_lot::{RwLock, RwLockReadGuard},
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
     solana_address::Address,
     solana_address_lookup_table_interface::{error::AddressLookupError, state::AddressLookupTable},
@@ -129,6 +129,11 @@ impl AccountsDb {
         let map = self.accounts.read();
         let mut iter = map.iter();
         f(&mut iter)
+    }
+
+    /// The account map under one guard, for a caller loading a whole transaction at once
+    pub(crate) fn read_accounts(&self) -> RwLockReadGuard<'_, AccountsMap> {
+        self.accounts.read()
     }
 
     pub(crate) fn share_accounts(&self) -> Arc<RwLock<AccountsMap>> {

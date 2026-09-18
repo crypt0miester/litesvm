@@ -1334,6 +1334,9 @@ impl LiteSVM {
         }
 
         let mut pre_rent_state_infos = Vec::with_capacity(account_keys.len());
+        // One guard over the whole load, the way agave's loader reads a transaction's accounts
+        // in a single pass, so a transaction takes the map once however many accounts it lists.
+        let loaded = self.accounts.read_accounts();
         let maybe_accounts = account_keys
             .iter()
             .enumerate()
@@ -1345,9 +1348,9 @@ impl LiteSVM {
                     (0, construct_instructions_account(message)?)
                 } else {
                     let is_instruction_account = message.is_instruction_account(i);
-                    let (loaded_size, mut account) = self
-                        .accounts
-                        .get_account(key)
+                    let (loaded_size, mut account) = loaded
+                        .get(key)
+                        .cloned()
                         .map(|acc| {
                             (
                                 TRANSACTION_ACCOUNT_BASE_SIZE.saturating_add(acc.data().len()),
@@ -1436,7 +1439,7 @@ impl LiteSVM {
                     .iter()
                     .any(|(key, _)| key == owner_id)
                 {
-                    let owner_account = self.accounts.get_account(owner_id).unwrap();
+                    let owner_account = loaded.get(owner_id).cloned().unwrap();
                     if !native_loader::check_id(owner_account.owner()) {
                         error!(
                             "Owner account {owner_id} is not owned by the native loader program."
@@ -1453,6 +1456,8 @@ impl LiteSVM {
                 Ok(program_index as IndexOfAccount)
             })
             .collect::<Result<Vec<u16>, TransactionError>>();
+
+        drop(loaded);
 
         match maybe_program_indices {
             Ok(program_indices) => {
