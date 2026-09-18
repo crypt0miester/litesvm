@@ -68,6 +68,13 @@ pub(crate) struct ExecutionResult {
     pub(crate) fee: u64,
 }
 
+/// A transaction run off a shared [`crate::LiteSVM`], waiting for the commit that lands it.
+pub struct ExecutedTransaction {
+    pub(crate) result: ExecutionResult,
+    pub(crate) payer_key: Option<Address>,
+    pub(crate) logs: Vec<String>,
+}
+
 impl Default for ExecutionResult {
     fn default() -> Self {
         Self {

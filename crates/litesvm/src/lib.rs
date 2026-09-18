@@ -332,7 +332,8 @@ use {
         programs::load_default_programs,
         reader::SharedHash,
         types::{
-            ExecutionResult, FailedTransactionMetadata, TransactionMetadata, TransactionResult,
+            ExecutedTransaction, ExecutionResult, FailedTransactionMetadata, TransactionMetadata,
+            TransactionResult,
         },
         utils::{
             create_blockhash,
@@ -1521,49 +1522,21 @@ impl LiteSVM {
         }
     }
 
-    fn execute_transaction_no_verify(
-        &mut self,
-        tx: VersionedTransaction,
-        log_collector: Rc<RefCell<LogCollector>>,
-    ) -> ExecutionResult {
-        map_sanitize_result(self.sanitize_transaction_no_verify(tx), |s_tx| {
-            self.execute_sanitized_transaction(&s_tx, log_collector)
-        })
-    }
-
-    fn execute_transaction(
-        &mut self,
-        tx: VersionedTransaction,
-        log_collector: Rc<RefCell<LogCollector>>,
-    ) -> ExecutionResult {
-        map_sanitize_result(self.sanitize_transaction(tx), |s_tx| {
-            self.execute_sanitized_transaction(&s_tx, log_collector)
-        })
-    }
-
-    fn execute_sanitized_transaction(
-        &mut self,
+    fn execute_sanitized_transaction_readonly(
+        &self,
         sanitized_tx: &SanitizedTransaction,
         log_collector: Rc<RefCell<LogCollector>>,
     ) -> ExecutionResult {
-        // Lend the program cache instead of cloning it per transaction; draining keeps it unchanged
-        let mut program_cache = std::mem::take(&mut self.accounts.programs_cache);
-        let result = self.execute_sanitized_transaction_inner(
-            sanitized_tx,
-            log_collector,
-            &mut program_cache,
-        );
-        program_cache.drain_modified_entries();
-        self.accounts.programs_cache = program_cache;
-        result
+        self.execute_sanitized_transaction_uncommitted(sanitized_tx, log_collector)
+            .0
     }
 
-    fn execute_sanitized_transaction_inner(
-        &mut self,
+    /// Process a transaction off &self, handing back the payer the caller owes the fee to
+    fn execute_sanitized_transaction_uncommitted(
+        &self,
         sanitized_tx: &SanitizedTransaction,
         log_collector: Rc<RefCell<LogCollector>>,
-        program_cache: &mut ProgramCacheForTxBatch,
-    ) -> ExecutionResult {
+    ) -> (ExecutionResult, Option<Address>) {
         let CheckAndProcessTransactionSuccess {
             core:
                 CheckAndProcessTransactionSuccessCore {
@@ -1573,45 +1546,6 @@ impl LiteSVM {
                 },
             fee,
             payer_key,
-        } = match self.check_and_process_transaction(sanitized_tx, log_collector, program_cache) {
-            Ok(value) => value,
-            Err(value) => return value,
-        };
-        if let Some(ctx) = context {
-            let mut exec_result =
-                execution_result_if_context(sanitized_tx, ctx, result, compute_units_consumed, fee);
-
-            if let Some(payer) = payer_key.filter(|_| exec_result.tx_result.is_err()) {
-                exec_result.tx_result = self
-                    .accounts
-                    .withdraw(&payer, fee)
-                    .and(exec_result.tx_result);
-            }
-            exec_result
-        } else {
-            ExecutionResult {
-                tx_result: result,
-                compute_units_consumed,
-                fee,
-                ..Default::default()
-            }
-        }
-    }
-
-    fn execute_sanitized_transaction_readonly(
-        &self,
-        sanitized_tx: &SanitizedTransaction,
-        log_collector: Rc<RefCell<LogCollector>>,
-    ) -> ExecutionResult {
-        let CheckAndProcessTransactionSuccess {
-            core:
-                CheckAndProcessTransactionSuccessCore {
-                    result,
-                    compute_units_consumed,
-                    context,
-                },
-            fee,
-            ..
         } = {
             let mut program_cache = self.accounts.programs_cache.clone();
             match self.check_and_process_transaction(
@@ -1620,10 +1554,10 @@ impl LiteSVM {
                 &mut program_cache,
             ) {
                 Ok(value) => value,
-                Err(value) => return value,
+                Err(value) => return (value, None),
             }
         };
-        if let Some(ctx) = context {
+        let executed = if let Some(ctx) = context {
             execution_result_if_context(sanitized_tx, ctx, result, compute_units_consumed, fee)
         } else {
             ExecutionResult {
@@ -1632,7 +1566,8 @@ impl LiteSVM {
                 fee,
                 ..Default::default()
             }
-        }
+        };
+        (executed, payer_key)
     }
 
     fn check_and_process_transaction<'a, 'b>(
@@ -1711,25 +1646,65 @@ impl LiteSVM {
 
     /// Submits a signed transaction.
     pub fn send_transaction(&mut self, tx: impl Into<VersionedTransaction>) -> TransactionResult {
+        let executed = self.execute_transaction_uncommitted(tx);
+        self.commit_transaction(executed)
+    }
+
+    /// Runs a signed transaction against this instance, writing nothing back.
+    ///
+    /// The pair of this and [`LiteSVM::commit_transaction`] is [`LiteSVM::send_transaction`]
+    /// split in two, for a caller running a batch of transactions that share no writable
+    /// account: every one of them executes off `&self` at once, and the commits land in
+    /// whatever order the caller keeps.
+    pub fn execute_transaction_uncommitted(
+        &self,
+        tx: impl Into<VersionedTransaction>,
+    ) -> ExecutedTransaction {
         let log_collector = new_log_collector(self.log_bytes_limit);
         let vtx: VersionedTransaction = tx.into();
+        let sanitized = if self.sigverify {
+            self.sanitize_transaction(vtx)
+        } else {
+            self.sanitize_transaction_no_verify(vtx)
+        };
+        let (result, payer_key) = match sanitized {
+            Ok(s_tx) => {
+                self.execute_sanitized_transaction_uncommitted(&s_tx, log_collector.clone())
+            }
+            Err(refused) => (refused, None),
+        };
+        let Ok(logs) = Rc::try_unwrap(log_collector).map(|lc| lc.into_inner().messages) else {
+            unreachable!("Log collector should not be used after execution returns")
+        };
+        ExecutedTransaction {
+            result,
+            payer_key,
+            logs,
+        }
+    }
+
+    /// Lands what [`LiteSVM::execute_transaction_uncommitted`] ran.
+    pub fn commit_transaction(&mut self, executed: ExecutedTransaction) -> TransactionResult {
+        let ExecutedTransaction {
+            result,
+            payer_key,
+            logs,
+        } = executed;
         let ExecutionResult {
             post_accounts,
-            tx_result,
+            mut tx_result,
             signature,
             compute_units_consumed,
             inner_instructions,
             return_data,
             included,
             fee,
-        } = if self.sigverify {
-            self.execute_transaction(vtx, log_collector.clone())
-        } else {
-            self.execute_transaction_no_verify(vtx, log_collector.clone())
-        };
-        let Ok(logs) = Rc::try_unwrap(log_collector).map(|lc| lc.into_inner().messages) else {
-            unreachable!("Log collector should not be used after send_transaction returns")
-        };
+        } = result;
+
+        if let Some(payer) = payer_key.filter(|_| tx_result.is_err()) {
+            tx_result = self.accounts.withdraw(&payer, fee).and(tx_result);
+        }
+
         let meta = TransactionMetadata {
             logs,
             inner_instructions,
