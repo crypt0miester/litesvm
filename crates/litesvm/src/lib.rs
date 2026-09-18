@@ -729,7 +729,7 @@ impl LiteSVM {
                 let loaded_program =
                     ProgramCacheEntry::new_builtin(0, builtint.name.len(), builtint.register_fn);
                 self.accounts
-                    .programs_cache
+                    .programs_mut()
                     .replenish(builtint.program_id, Arc::new(loaded_program));
                 self.accounts.add_builtin_account(
                     builtint.program_id,
@@ -1048,7 +1048,7 @@ impl LiteSVM {
         );
 
         self.accounts
-            .programs_cache
+            .programs_mut()
             .replenish(program_id, Arc::new(builtin));
 
         let mut account = AccountSharedData::new(1, 1, &native_loader::id());
@@ -1170,7 +1170,7 @@ impl LiteSVM {
         loaded_program.effective_slot = current_slot;
 
         self.accounts
-            .programs_cache
+            .programs_mut()
             .replenish(program_id, Arc::new(loaded_program));
 
         Ok(())
@@ -1552,12 +1552,9 @@ impl LiteSVM {
             fee,
             payer_key,
         } = {
-            let mut program_cache = self.accounts.programs_cache.clone();
-            match self.check_and_process_transaction(
-                sanitized_tx,
-                log_collector,
-                &mut program_cache,
-            ) {
+            match self.with_program_cache(|program_cache| {
+                self.check_and_process_transaction(sanitized_tx, log_collector, program_cache)
+            }) {
                 Ok(value) => value,
                 Err(value) => return (value, None),
             }
@@ -1573,6 +1570,37 @@ impl LiteSVM {
             }
         };
         (executed, payer_key)
+    }
+
+    /// Run `f` against the copy of the program cache this thread holds
+    ///
+    /// The copy a transaction runs against is thrown away afterwards, so a deploy's entries are
+    /// drained back off the one held here and the next transaction sees what a fresh copy holds.
+    /// A cache edited anywhere hands out a new stamp, and the stamp is what retakes the copy.
+    fn with_program_cache<R>(&self, f: impl FnOnce(&mut ProgramCacheForTxBatch) -> R) -> R {
+        thread_local! {
+            static HELD: RefCell<Option<(u64, ProgramCacheForTxBatch)>> =
+                const { RefCell::new(None) };
+        }
+
+        let stamp = self.accounts.programs_stamp();
+        HELD.with(|held| {
+            // A transaction reached from inside another one takes a copy of its own.
+            let Ok(mut held) = held.try_borrow_mut() else {
+                return f(&mut self.accounts.programs().clone());
+            };
+            let copy = match held.take() {
+                Some((taken, copy)) if taken == stamp => copy,
+                _ => self.accounts.programs().clone(),
+            };
+            let cache = &mut held.insert((stamp, copy)).1;
+            let out = f(cache);
+            cache.drain_modified_entries();
+            cache.hit_max_limit = false;
+            cache.loaded_missing = false;
+            cache.merged_modified = false;
+            out
+        })
     }
 
     fn check_and_process_transaction<'a, 'b>(

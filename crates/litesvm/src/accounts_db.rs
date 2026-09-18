@@ -40,11 +40,21 @@ use {
     solana_system_program::{get_system_account_kind, SystemAccountKind},
     solana_sysvar::Sysvar,
     solana_transaction_error::{AddressLoaderError, TransactionError},
-    std::sync::Arc,
+    std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     wincode::DeserializeOwned,
 };
 
 pub(crate) type AccountsMap = HashMap<Address, AccountSharedData>;
+
+/// Stamps handed to program caches, so a copy of one says which cache and which edit of it
+static PROGRAMS_EDITED: AtomicU64 = AtomicU64::new(0);
+
+fn next_programs_stamp() -> u64 {
+    PROGRAMS_EDITED.fetch_add(1, Ordering::Relaxed)
+}
 
 const FEES_ID: Address = Address::from_str_const("SysvarFees111111111111111111111111111111111");
 const RECENT_BLOCKHASHES_ID: Address =
@@ -75,7 +85,10 @@ where
 /// Account map shared behind a lock; writers lock once and hand the guard to the _locked methods
 pub struct AccountsDb {
     accounts: Arc<RwLock<AccountsMap>>,
-    pub programs_cache: ProgramCacheForTxBatch,
+    programs_cache: ProgramCacheForTxBatch,
+
+    /// What this cache stands at, a fresh number on every instance and every edit
+    programs_stamp: u64,
     pub sysvar_cache: SysvarCache,
     pub environments: ProgramRuntimeEnvironments,
     rent: Option<solana_rent::Rent>,
@@ -86,6 +99,7 @@ impl Clone for AccountsDb {
         Self {
             accounts: Arc::new(RwLock::new(self.accounts.read().clone())),
             programs_cache: self.programs_cache.clone(),
+            programs_stamp: next_programs_stamp(),
             sysvar_cache: self.sysvar_cache.clone(),
             environments: ProgramRuntimeEnvironments::new(
                 self.environments.get_env_for_execution().clone(),
@@ -105,6 +119,7 @@ impl Default for AccountsDb {
         Self {
             accounts: Arc::new(RwLock::new(AccountsMap::default())),
             programs_cache: ProgramCacheForTxBatch::new(0),
+            programs_stamp: next_programs_stamp(),
             sysvar_cache: SysvarCache::default(),
             environments: ProgramRuntimeEnvironments::new(env.clone(), env),
             rent: None,
@@ -113,6 +128,22 @@ impl Default for AccountsDb {
 }
 
 impl AccountsDb {
+    /// The programs a transaction runs against
+    pub(crate) fn programs(&self) -> &ProgramCacheForTxBatch {
+        &self.programs_cache
+    }
+
+    /// The programs for an edit, which every copy taken of them has to be taken again after
+    pub(crate) fn programs_mut(&mut self) -> &mut ProgramCacheForTxBatch {
+        self.programs_stamp = next_programs_stamp();
+        &mut self.programs_cache
+    }
+
+    /// Which cache and which edit of it a copy would be taken from
+    pub(crate) fn programs_stamp(&self) -> u64 {
+        self.programs_stamp
+    }
+
     pub fn get_account(&self, pubkey: &Address) -> Option<AccountSharedData> {
         self.accounts.read().get(pubkey).cloned()
     }
@@ -165,6 +196,7 @@ impl AccountsDb {
         Self {
             accounts: Arc::new(RwLock::new(working)),
             programs_cache: self.programs_cache.clone(),
+            programs_stamp: next_programs_stamp(),
             sysvar_cache: self.sysvar_cache.clone(),
             environments: ProgramRuntimeEnvironments::new(
                 self.environments.get_env_for_execution().clone(),
@@ -207,7 +239,7 @@ impl AccountsDb {
             && account.owner() != &native_loader::ID
         {
             let loaded_program = self.load_program(map, &account)?;
-            self.programs_cache
+            self.programs_mut()
                 .replenish(pubkey, Arc::new(loaded_program));
         } else {
             self.maybe_handle_sysvar_account(map, pubkey, &account)?;
@@ -238,7 +270,7 @@ impl AccountsDb {
             CLOCK_ID => {
                 let parsed = Clock::deserialize_from(account.data())
                     .map_err(|_| InvalidSysvarDataError::Clock)?;
-                self.programs_cache.set_slot_for_tests(parsed.slot);
+                self.programs_mut().set_slot_for_tests(parsed.slot);
                 self.sysvar_cache.set_sysvar_for_tests(&parsed);
             }
             EPOCH_REWARDS_ID => {
@@ -323,7 +355,7 @@ impl AccountsDb {
                 }
             });
         if let Ok(clock) = self.sysvar_cache.get_clock() {
-            self.programs_cache.set_slot_for_tests(clock.slot);
+            self.programs_mut().set_slot_for_tests(clock.slot);
         }
         self.rent = self
             .sysvar_cache
@@ -345,7 +377,7 @@ impl AccountsDb {
 
         for (key, account) in executable_accounts {
             let loaded = self.load_program(&map, &account)?;
-            self.programs_cache.replenish(key, Arc::new(loaded));
+            self.programs_mut().replenish(key, Arc::new(loaded));
         }
         Ok(())
     }
