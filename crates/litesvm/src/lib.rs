@@ -1685,17 +1685,20 @@ impl LiteSVM {
         } else {
             self.sanitize_transaction_no_verify(vtx)
         };
-        let (result, payer_key) = match sanitized {
+        let (transaction, result, payer_key) = match sanitized {
             Ok(s_tx) => {
-                self.execute_sanitized_transaction_uncommitted(&s_tx, log_collector.clone())
+                let (result, payer_key) =
+                    self.execute_sanitized_transaction_uncommitted(&s_tx, log_collector.clone());
+                (Some(s_tx.into_versioned_transaction()), result, payer_key)
             }
-            Err(refused) => (refused, None),
+            Err(refused) => (None, refused, None),
         };
         let Ok(logs) = Rc::try_unwrap(log_collector).map(|lc| lc.into_inner().messages) else {
             unreachable!("Log collector should not be used after execution returns")
         };
         ExecutedTransaction {
             instance: self.accounts.instance(),
+            transaction,
             result,
             payer_key,
             logs,
@@ -1708,6 +1711,7 @@ impl LiteSVM {
     pub fn commit_transaction(&mut self, executed: ExecutedTransaction) -> TransactionResult {
         let ExecutedTransaction {
             instance,
+            transaction: _,
             result,
             payer_key,
             logs,
