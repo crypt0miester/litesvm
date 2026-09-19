@@ -1766,7 +1766,7 @@ impl LiteSVM {
             }
             self.accounts
                 .sync_accounts(post_accounts)
-                .expect("It shouldn't be possible to write invalid sysvars in send_transaction.");
+                .expect("It shouldn't be possible to write invalid sysvars in commit_transaction.");
 
             TransactionResult::Ok(meta)
         }
