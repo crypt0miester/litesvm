@@ -292,7 +292,6 @@ Other things you can do with `litesvm` include:
 | `hashbrown` | Switches internal hash maps to `hashbrown`. |
 | `serde` | Enables serde serialization/deserialization on internal types. |
 | `nodejs-internal` | Used by the Node.js bindings; not intended for direct use. |
-| `internal-test` | Enables internal test helpers; not intended for direct use. |
 
 ## When should I use `solana-test-validator`?
 
@@ -721,6 +720,7 @@ impl LiteSVM {
 
     #[cfg_attr(feature = "nodejs-internal", qualifiers(pub))]
     fn set_builtins(&mut self) {
+        let (lamports, rent_epoch) = solana_account::DUMMY_INHERITABLE_ACCOUNT_FIELDS;
         BUILTINS.iter().for_each(|builtint| {
             if builtint
                 .enable_feature_id
@@ -731,9 +731,15 @@ impl LiteSVM {
                 self.accounts
                     .programs_mut()
                     .replenish(builtint.program_id, Arc::new(loaded_program));
-                self.accounts.add_builtin_account(
+                self.accounts.add_account_no_checks(
                     builtint.program_id,
-                    crate::utils::create_loadable_account_for_test(builtint.name),
+                    AccountSharedData::from(Account {
+                        lamports,
+                        owner: native_loader::id(),
+                        data: builtint.name.as_bytes().to_vec(),
+                        executable: true,
+                        rent_epoch,
+                    }),
                 );
             }
         });
@@ -1859,11 +1865,6 @@ impl LiteSVM {
     /// Returns whether transaction signature verification is enabled.
     pub fn get_sigverify(&self) -> bool {
         self.sigverify
-    }
-
-    #[cfg(feature = "internal-test")]
-    pub fn get_feature_set(&self) -> Arc<FeatureSet> {
-        self.feature_set.clone().into()
     }
 
     fn check_transaction_age(&self, tx: &SanitizedTransaction) -> Result<(), ExecutionResult> {

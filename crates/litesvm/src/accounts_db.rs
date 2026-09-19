@@ -337,11 +337,6 @@ impl AccountsDb {
         Ok(())
     }
 
-    /// Skip the executable() checks for builtin accounts
-    pub(crate) fn add_builtin_account(&mut self, address: Address, data: AccountSharedData) {
-        self.accounts.write().insert(address, data);
-    }
-
     /// Rebuilds the sysvar cache from account data already in the map
     #[cfg(feature = "persistence-internal")]
     pub(crate) fn rebuild_sysvar_cache(&mut self) {
