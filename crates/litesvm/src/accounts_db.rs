@@ -56,6 +56,13 @@ fn next_programs_stamp() -> u64 {
     PROGRAMS_EDITED.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Numbers handed to instances, so a transaction says which one it ran against
+static INSTANCES: AtomicU64 = AtomicU64::new(0);
+
+fn next_instance() -> u64 {
+    INSTANCES.fetch_add(1, Ordering::Relaxed)
+}
+
 const FEES_ID: Address = Address::from_str_const("SysvarFees111111111111111111111111111111111");
 const RECENT_BLOCKHASHES_ID: Address =
     Address::from_str_const("SysvarRecentB1ockHashes11111111111111111111");
@@ -87,6 +94,9 @@ pub struct AccountsDb {
     accounts: Arc<RwLock<AccountsMap>>,
     programs_cache: ProgramCacheForTxBatch,
 
+    /// What this instance goes by, which no other instance shares
+    instance: u64,
+
     /// What this cache stands at, a fresh number on every instance and every edit
     programs_stamp: u64,
     pub sysvar_cache: SysvarCache,
@@ -99,6 +109,7 @@ impl Clone for AccountsDb {
         Self {
             accounts: Arc::new(RwLock::new(self.accounts.read().clone())),
             programs_cache: self.programs_cache.clone(),
+            instance: next_instance(),
             programs_stamp: next_programs_stamp(),
             sysvar_cache: self.sysvar_cache.clone(),
             environments: ProgramRuntimeEnvironments::new(
@@ -119,6 +130,7 @@ impl Default for AccountsDb {
         Self {
             accounts: Arc::new(RwLock::new(AccountsMap::default())),
             programs_cache: ProgramCacheForTxBatch::new(0),
+            instance: next_instance(),
             programs_stamp: next_programs_stamp(),
             sysvar_cache: SysvarCache::default(),
             environments: ProgramRuntimeEnvironments::new(env.clone(), env),
@@ -142,6 +154,11 @@ impl AccountsDb {
     /// Which cache and which edit of it a copy would be taken from
     pub(crate) fn programs_stamp(&self) -> u64 {
         self.programs_stamp
+    }
+
+    /// The instance a transaction runs against, which is the one that may commit it
+    pub(crate) fn instance(&self) -> u64 {
+        self.instance
     }
 
     pub fn get_account(&self, pubkey: &Address) -> Option<AccountSharedData> {
@@ -196,6 +213,7 @@ impl AccountsDb {
         Self {
             accounts: Arc::new(RwLock::new(working)),
             programs_cache: self.programs_cache.clone(),
+            instance: next_instance(),
             programs_stamp: next_programs_stamp(),
             sysvar_cache: self.sysvar_cache.clone(),
             environments: ProgramRuntimeEnvironments::new(

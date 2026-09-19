@@ -1695,6 +1695,8 @@ impl LiteSVM {
     /// split in two, for a caller running a batch of transactions that share no writable
     /// account: every one of them executes off `&self` at once, and the commits land in
     /// whatever order the caller keeps.
+    ///
+    /// What comes back belongs to this instance, and only this instance may commit it.
     pub fn execute_transaction_uncommitted(
         &self,
         tx: impl Into<VersionedTransaction>,
@@ -1716,6 +1718,7 @@ impl LiteSVM {
             unreachable!("Log collector should not be used after execution returns")
         };
         ExecutedTransaction {
+            instance: self.accounts.instance(),
             result,
             payer_key,
             logs,
@@ -1723,12 +1726,20 @@ impl LiteSVM {
     }
 
     /// Lands what [`LiteSVM::execute_transaction_uncommitted`] ran.
+    ///
+    /// The transaction has to be one this same instance executed.
     pub fn commit_transaction(&mut self, executed: ExecutedTransaction) -> TransactionResult {
         let ExecutedTransaction {
+            instance,
             result,
             payer_key,
             logs,
         } = executed;
+        debug_assert_eq!(
+            instance,
+            self.accounts.instance(),
+            "a transaction commits to the instance it ran against"
+        );
         let ExecutionResult {
             post_accounts,
             mut tx_result,

@@ -70,6 +70,8 @@ pub(crate) struct ExecutionResult {
 
 /// A transaction run off a shared [`crate::LiteSVM`], waiting for the commit that lands it.
 pub struct ExecutedTransaction {
+    /// The instance this ran against, which is the only one that may commit it
+    pub(crate) instance: u64,
     pub(crate) result: ExecutionResult,
     pub(crate) payer_key: Option<Address>,
     pub(crate) logs: Vec<String>,
