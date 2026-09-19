@@ -726,8 +726,7 @@ impl LiteSVM {
                 .enable_feature_id
                 .is_none_or(|x| self.feature_set.is_active(&x))
             {
-                let loaded_program =
-                    ProgramCacheEntry::new_builtin(0, builtint.register_fn);
+                let loaded_program = ProgramCacheEntry::new_builtin(0, builtint.register_fn);
                 self.accounts
                     .programs_mut()
                     .replenish(builtint.program_id, Arc::new(loaded_program));

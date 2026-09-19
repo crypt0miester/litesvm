@@ -498,7 +498,9 @@ impl AccountsDb {
                     metrics,
                 )
                 .map_err(|_| {
-                    error!("Error encountered when calling ProgramCacheEntry::load() for loader_v4.");
+                    error!(
+                        "Error encountered when calling ProgramCacheEntry::load() for loader_v4."
+                    );
                     InstructionError::InvalidAccountData
                 })
             } else {
