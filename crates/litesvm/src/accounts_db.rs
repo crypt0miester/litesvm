@@ -23,7 +23,9 @@ use {
         loaded_programs::{
             ProgramCacheForTxBatch, ProgramRuntimeEnvironment, ProgramRuntimeEnvironments,
         },
-        program_cache_entry::{ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType},
+        program_cache_entry::{
+            ProgramCacheEntry, ProgramCacheEntryOwner, DELAY_VISIBILITY_SLOT_OFFSET,
+        },
         program_metrics::LoadProgramMetrics,
         solana_sbpf::program::BuiltinProgram,
         sysvar_cache::SysvarCache,
@@ -129,7 +131,7 @@ impl Default for AccountsDb {
 
         Self {
             accounts: Arc::new(RwLock::new(AccountsMap::default())),
-            programs_cache: ProgramCacheForTxBatch::new(0),
+            programs_cache: ProgramCacheForTxBatch::new(DELAY_VISIBILITY_SLOT_OFFSET),
             instance: next_instance(),
             programs_stamp: next_programs_stamp(),
             sysvar_cache: SysvarCache::default(),
@@ -162,8 +164,12 @@ impl AccountsDb {
     }
 
     /// Move the cache to `slot`, which hands out no stamp because it retakes no copy
+    ///
+    /// The cache stands one slot ahead of the chain, so a program deployed in `slot` is usable
+    /// in it.
     pub(crate) fn set_programs_slot(&mut self, slot: u64) {
-        self.programs_cache.set_slot_for_tests(slot);
+        self.programs_cache
+            .set_slot_for_tests(slot.saturating_add(DELAY_VISIBILITY_SLOT_OFFSET));
     }
 
     /// The instance a transaction runs against, which is the one that may commit it
@@ -435,13 +441,11 @@ impl AccountsDb {
         let slot = self.sysvar_cache.get_clock().map(|c| c.slot).unwrap_or(0);
 
         if bpf_loader::check_id(owner) || bpf_loader_deprecated::check_id(owner) {
-            ProgramCacheEntry::new(
+            ProgramCacheEntry::load(
                 owner,
                 program_runtime_for_execution,
                 slot,
-                slot,
                 program_account.data(),
-                program_account.data().len(),
                 metrics,
             )
             .map_err(|e| {
@@ -459,28 +463,22 @@ impl AccountsDb {
                 return Err(InstructionError::InvalidAccountData);
             };
             let Some(programdata_account) = map.get(&programdata_address) else {
-                return Ok(ProgramCacheEntry::new_tombstone(
+                return Ok(ProgramCacheEntry::new_closed_tombstone(
                     slot,
                     ProgramCacheEntryOwner::LoaderV3,
-                    ProgramCacheEntryType::Closed,
                 ));
             };
             let program_data = programdata_account.data();
             if let Some(programdata) =
                 program_data.get(UpgradeableLoaderState::size_of_programdata_metadata()..)
             {
-                ProgramCacheEntry::new(
+                ProgramCacheEntry::load(
                     owner,
                     program_runtime_for_execution,
                     slot,
-                    slot,
                     programdata,
-                    program_account
-                        .data()
-                        .len()
-                        .saturating_add(program_data.len()),
                     metrics).map_err(|e| {
-                        error!("Error encountered when calling ProgramCacheEntry::new() for bpf_loader_upgradeable: {e:?}");
+                        error!("Error encountered when calling ProgramCacheEntry::load() for bpf_loader_upgradeable: {e:?}");
                         InstructionError::InvalidAccountData
                     })
             } else {
@@ -492,17 +490,15 @@ impl AccountsDb {
                 .data()
                 .get(LoaderV4State::program_data_offset()..)
             {
-                ProgramCacheEntry::new(
+                ProgramCacheEntry::load(
                     &loader_v4::id(),
                     program_runtime_for_execution,
                     slot,
-                    slot,
                     elf_bytes,
-                    program_account.data().len(),
                     metrics,
                 )
                 .map_err(|_| {
-                    error!("Error encountered when calling LoadedProgram::new() for loader_v4.");
+                    error!("Error encountered when calling ProgramCacheEntry::load() for loader_v4.");
                     InstructionError::InvalidAccountData
                 })
             } else {
