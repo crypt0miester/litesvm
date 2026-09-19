@@ -1580,9 +1580,10 @@ impl LiteSVM {
 
     /// Run `f` against the copy of the program cache this thread holds
     ///
-    /// The copy a transaction runs against is thrown away afterwards, so a deploy's entries are
-    /// drained back off the one held here and the next transaction sees what a fresh copy holds.
-    /// A cache edited anywhere hands out a new stamp, and the stamp is what retakes the copy.
+    /// The copy is held for the next transaction as long as it comes back clean. A transaction
+    /// that wrote anything into it drops the whole copy, so every field of it resets and no
+    /// state of one run reaches the next. A cache edited anywhere hands out a new stamp, and
+    /// the stamp is what retakes the copy.
     fn with_program_cache<R>(&self, f: impl FnOnce(&mut ProgramCacheForTxBatch) -> R) -> R {
         thread_local! {
             static HELD: RefCell<Option<(u64, ProgramCacheForTxBatch)>> =
@@ -1601,10 +1602,13 @@ impl LiteSVM {
             };
             let cache = &mut held.insert((stamp, copy)).1;
             let out = f(cache);
-            cache.drain_modified_entries();
-            cache.hit_max_limit = false;
-            cache.loaded_missing = false;
-            cache.merged_modified = false;
+            let marked = cache.hit_max_limit
+                || cache.loaded_missing
+                || cache.merged_modified
+                || !cache.drain_modified_entries().is_empty();
+            if marked {
+                held.take();
+            }
             out
         })
     }
