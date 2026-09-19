@@ -156,6 +156,16 @@ impl AccountsDb {
         self.programs_stamp
     }
 
+    /// The slot the program cache stands at, which every copy is set to after it is taken
+    pub(crate) fn programs_slot(&self) -> u64 {
+        self.programs_cache.slot()
+    }
+
+    /// Move the cache to `slot`, which hands out no stamp because it retakes no copy
+    pub(crate) fn set_programs_slot(&mut self, slot: u64) {
+        self.programs_cache.set_slot_for_tests(slot);
+    }
+
     /// The instance a transaction runs against, which is the one that may commit it
     pub(crate) fn instance(&self) -> u64 {
         self.instance
@@ -288,7 +298,7 @@ impl AccountsDb {
             CLOCK_ID => {
                 let parsed = Clock::deserialize_from(account.data())
                     .map_err(|_| InvalidSysvarDataError::Clock)?;
-                self.programs_mut().set_slot_for_tests(parsed.slot);
+                self.set_programs_slot(parsed.slot);
                 self.sysvar_cache.set_sysvar_for_tests(&parsed);
             }
             EPOCH_REWARDS_ID => {
@@ -368,7 +378,7 @@ impl AccountsDb {
                 }
             });
         if let Ok(clock) = self.sysvar_cache.get_clock() {
-            self.programs_mut().set_slot_for_tests(clock.slot);
+            self.set_programs_slot(clock.slot);
         }
         self.rent = self
             .sysvar_cache

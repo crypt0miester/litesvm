@@ -1601,6 +1601,8 @@ impl LiteSVM {
                 _ => self.accounts.programs().clone(),
             };
             let cache = &mut held.insert((stamp, copy)).1;
+            // The slot moves without a new stamp, so a copy is put on it here.
+            cache.set_slot_for_tests(self.accounts.programs_slot());
             let out = f(cache);
             let marked = cache.hit_max_limit
                 || cache.loaded_missing
