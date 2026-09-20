@@ -368,7 +368,7 @@ use {
         loaded_programs::{
             ProgramCacheForTxBatch, ProgramRuntimeEnvironment, ProgramRuntimeEnvironments,
         },
-        program_cache_entry::ProgramCacheEntry,
+        program_cache_entry::{ProgramCacheEntry, DELAY_VISIBILITY_SLOT_OFFSET},
         program_metrics::LoadProgramMetrics,
         solana_sbpf::program::BuiltinProgram,
     },
@@ -1145,10 +1145,11 @@ impl LiteSVM {
 
         let program_runtime_for_deployment =
             self.accounts.environments.get_env_for_deployment().clone();
+        // A program added here is usable in the slot it was added, so it deploys one slot back.
         let loaded_program = ProgramCacheEntry::load(
             loader_id,
             program_runtime_for_deployment,
-            current_slot,
+            current_slot.saturating_sub(DELAY_VISIBILITY_SLOT_OFFSET),
             program_bytes,
             &mut LoadProgramMetrics::default(),
         )

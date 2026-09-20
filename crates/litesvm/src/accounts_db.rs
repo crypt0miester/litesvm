@@ -131,7 +131,7 @@ impl Default for AccountsDb {
 
         Self {
             accounts: Arc::new(RwLock::new(AccountsMap::default())),
-            programs_cache: ProgramCacheForTxBatch::new(DELAY_VISIBILITY_SLOT_OFFSET),
+            programs_cache: ProgramCacheForTxBatch::new(0),
             instance: next_instance(),
             programs_stamp: next_programs_stamp(),
             sysvar_cache: SysvarCache::default(),
@@ -164,12 +164,8 @@ impl AccountsDb {
     }
 
     /// Move the cache to `slot`, which hands out no stamp because it retakes no copy
-    ///
-    /// The cache stands one slot ahead of the chain, so a program deployed in `slot` is usable
-    /// in it.
     pub(crate) fn set_programs_slot(&mut self, slot: u64) {
-        self.programs_cache
-            .set_slot_for_tests(slot.saturating_add(DELAY_VISIBILITY_SLOT_OFFSET));
+        self.programs_cache.set_slot_for_tests(slot);
     }
 
     /// The instance a transaction runs against, which is the one that may commit it
@@ -438,7 +434,14 @@ impl AccountsDb {
 
         let owner = program_account.owner();
         let program_runtime_for_execution = self.environments.get_env_for_execution().clone();
-        let slot = self.sysvar_cache.get_clock().map(|c| c.slot).unwrap_or(0);
+        // A program loaded from its account is usable now, so it deploys one slot back and its
+        // derived effective slot lands on the current one.
+        let slot = self
+            .sysvar_cache
+            .get_clock()
+            .map(|c| c.slot)
+            .unwrap_or(0)
+            .saturating_sub(DELAY_VISIBILITY_SLOT_OFFSET);
 
         if bpf_loader::check_id(owner) || bpf_loader_deprecated::check_id(owner) {
             ProgramCacheEntry::load(
